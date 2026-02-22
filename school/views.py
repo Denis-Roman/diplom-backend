@@ -1,8 +1,20 @@
+import os
+import json
 import bcrypt
+import jwt
+from datetime import timedelta
+from django.conf import settings
+from django.core.files.storage import default_storage
+from django.utils.text import get_valid_filename
+from django.utils.dateparse import parse_date
+from urllib.parse import quote
+from urllib.request import urlopen
+from urllib.error import URLError, HTTPError
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from django.db import models
+from django.db.models import Sum
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated
@@ -17,8 +29,9 @@ from rest_framework.response import Response
 from school.models import (
     User, Group, GroupStudent, Subject, Lesson, Task, LessonGrade,
     Attendance, Invoice, Notification, News, ExtraNews, StudentPoint,
-    Team, TeamMember, Chat, ChatMessage, Poll,
-    PollOption, CourseMaterial, CourseTest, TestQuestion, QuestionOption, PollVote, Course, Puzzle, LearningMaterial
+    Team, TeamMember, Chat, ChatParticipant, ChatMessage, ChatMessageAttachment, Poll,
+    PollOption, CourseMaterial, CourseTest, TestQuestion, QuestionOption, PollVote, Course, Puzzle, LearningMaterial,
+    TaskSubmission, SubmissionFile,
 )
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import AllowAny
@@ -59,9 +72,38 @@ from rest_framework.response import Response
 from django.utils import timezone
 from django.contrib.auth.hashers import make_password, check_password
 
+
+def _effective_role(user) -> str | None:
+    if not user:
+        return None
+    if getattr(user, 'is_superadmin', False):
+        return 'superadmin'
+    return getattr(user, 'role', None)
+
+
+def _require_roles(request, roles: tuple[str, ...]):
+    role = _effective_role(getattr(request, 'user', None))
+    if role not in roles:
+        return Response({'detail': 'Forbidden'}, status=403)
+    return None
+
+
+def _can_access_user(viewer: User, target: User) -> bool:
+    viewer_role = _effective_role(viewer)
+    if viewer_role == 'superadmin':
+        return True
+    if getattr(target, 'is_superadmin', False) or getattr(target, 'role', None) == 'superadmin':
+        return False
+    if viewer_role == 'admin':
+        return True
+    return viewer.id == target.id
+
 @api_view(['GET', 'PUT', 'DELETE'])
-@permission_classes([AllowAny])
+@permission_classes([IsAuthenticated])
 def administrator_detail(request, pk):
+    forbidden = _require_roles(request, ('superadmin',))
+    if forbidden:
+        return forbidden
     try:
         admin = User.objects.get(id=pk, role__in=['admin', 'superadmin'])
     except User.DoesNotExist:
@@ -101,9 +143,12 @@ def administrator_detail(request, pk):
         return Response({'success': True})
 
 @api_view(['PUT', 'PATCH'])
-@permission_classes([AllowAny])
+@permission_classes([IsAuthenticated])
 @parser_classes([MultiPartParser, FormParser])
 def news_update(request, pk):
+    forbidden = _require_roles(request, ('admin', 'superadmin'))
+    if forbidden:
+        return forbidden
     """
     Оновлення (редагування) новини, підтримує multipart/form-data (upload фото з комп'ютера)
     """
@@ -129,9 +174,12 @@ def news_update(request, pk):
     return Response({'success': True, 'news_id': news.id})
 
 @api_view(['POST'])
-@permission_classes([AllowAny])
+@permission_classes([IsAuthenticated])
 @parser_classes([MultiPartParser, FormParser])
 def news_create(request):
+    forbidden = _require_roles(request, ('admin', 'superadmin'))
+    if forbidden:
+        return forbidden
     title = request.data.get('title', '').strip()
     image_file = request.FILES.get('image_file')
     content = request.data.get('content', '').strip()
@@ -158,6 +206,9 @@ def news_create(request):
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])  # для продакшн, для тест��в можеш вмикати AllowAny
 def create_invoice(request):
+    forbidden = _require_roles(request, ('admin', 'superadmin'))
+    if forbidden:
+        return forbidden
     students = request.data.get('student_ids', [])
     amount = request.data.get('amount')
     description = request.data.get('description', '')
@@ -233,8 +284,11 @@ def invoices_list(request):
 # ===== AUTHENTICATION =====
 
 @api_view(['GET', 'POST'])
-@permission_classes([AllowAny])
+@permission_classes([IsAuthenticated])
 def administrators_list(request):
+    forbidden = _require_roles(request, ('superadmin',))
+    if forbidden:
+        return forbidden
     if request.method == 'POST':
         name = request.data.get('name', '').strip()
         email = request.data.get('email', '').lower()
@@ -305,18 +359,45 @@ def auth_register(request):
 @api_view(['POST'])
 @permission_classes([AllowAny])
 def auth_logout(request):
-    return Response({'success': True}, status=200)
+    response = Response({'success': True}, status=200)
+    response.delete_cookie('auth-token')
+    return response
 
 
 @api_view(['GET'])
 @permission_classes([AllowAny])
 def auth_me(request):
-    return Response({'success': True, 'user': None}, status=200)
+    user = getattr(request, 'user', None)
+    if not isinstance(user, User):
+        return Response({'success': True, 'user': None}, status=200)
+
+    effective_role = user.role
+    if getattr(user, 'is_superadmin', False) and effective_role != 'superadmin':
+        effective_role = 'superadmin'
+
+    return Response(
+        {
+            'success': True,
+            'user': {
+                'id': user.id,
+                'email': user.email,
+                'name': user.name,
+                'role': effective_role,
+                'is_active': user.is_active,
+                'is_superadmin': user.is_superadmin,
+                'group_id': user.group_id,
+            },
+        },
+        status=200,
+    )
 
 
 @api_view(['POST'])
-@permission_classes([AllowAny])
+@permission_classes([IsAuthenticated])
 def admin_toggle_status(request, pk):
+    forbidden = _require_roles(request, ('superadmin',))
+    if forbidden:
+        return forbidden
     try:
         user = User.objects.get(pk=pk)
         if user.is_superadmin:
@@ -328,8 +409,11 @@ def admin_toggle_status(request, pk):
         return Response({"error": "Admin not found."}, status=404)
 
 @api_view(['DELETE'])
-@permission_classes([AllowAny])
+@permission_classes([IsAuthenticated])
 def admin_delete(request, pk):
+    forbidden = _require_roles(request, ('superadmin',))
+    if forbidden:
+        return forbidden
     try:
         user = User.objects.get(pk=pk)
         if user.is_superadmin:
@@ -353,24 +437,371 @@ def auth_login(request):
         return Response({'success': False, 'error': 'Невірний email або пароль'}, status=401)
     if not check_password(password, user.password):
         return Response({'success': False, 'error': 'Невірний email або пароль'}, status=401)
-    return Response({
-        'success': True,
-        'user': {
-            'id': user.id,
-            'email': user.email,
-            'name': user.name,
-            'role': user.role,
-            'is_active': user.is_active,
-            'is_superadmin': user.is_superadmin,
-        }
-    })
+    token = jwt.encode(
+        {
+            'userId': user.id,
+            'exp': timezone.now() + timedelta(days=7),
+        },
+        settings.JWT_SECRET,
+        algorithm='HS256',
+    )
+
+    effective_role = user.role
+    if getattr(user, 'is_superadmin', False) and effective_role != 'superadmin':
+        effective_role = 'superadmin'
+
+    response = Response(
+        {
+            'success': True,
+            'token': token,
+            'user': {
+                'id': user.id,
+                'email': user.email,
+                'name': user.name,
+                'role': effective_role,
+                'is_active': user.is_active,
+                'is_superadmin': user.is_superadmin,
+                'group_id': user.group_id,
+            },
+        },
+        status=200,
+    )
+
+    response.set_cookie(
+        'auth-token',
+        token,
+        httponly=True,
+        samesite=os.getenv('AUTH_COOKIE_SAMESITE', 'Lax'),
+        secure=os.getenv('AUTH_COOKIE_SECURE', 'False').lower() in ('true', '1', 'yes'),
+        max_age=60 * 60 * 24 * 7,
+        path='/',
+    )
+
+    return response
+
+
+@api_view(['POST'])
+@permission_classes([AllowAny])
+def auth_google(request):
+    """Authenticate with Google ID token.
+
+    Expects JSON: {"id_token": "..."}
+    Returns: {success, token, user}
+    """
+    id_token = request.data.get('id_token')
+    if not id_token:
+        return Response({'success': False, 'error': 'missing_id_token'}, status=400)
+
+    try:
+        with urlopen(
+            f"https://oauth2.googleapis.com/tokeninfo?id_token={quote(str(id_token))}"
+        ) as response:
+            token_info = json.loads(response.read().decode('utf-8'))
+    except HTTPError:
+        return Response({'success': False, 'error': 'invalid_id_token'}, status=401)
+    except URLError:
+        return Response({'success': False, 'error': 'google_unreachable'}, status=502)
+    except Exception:
+        return Response({'success': False, 'error': 'google_auth_failed'}, status=401)
+
+    email = (token_info.get('email') or '').strip().lower()
+    if not email:
+        return Response({'success': False, 'error': 'google_missing_email'}, status=400)
+
+    expected_aud = os.getenv('GOOGLE_CLIENT_ID', '').strip()
+    aud = (token_info.get('aud') or '').strip()
+    if expected_aud and aud and aud != expected_aud:
+        return Response({'success': False, 'error': 'invalid_audience'}, status=401)
+
+    email_verified = token_info.get('email_verified')
+    if str(email_verified).lower() not in ('true', '1', 'yes'):
+        return Response({'success': False, 'error': 'email_not_verified'}, status=401)
+
+    user = User.objects.filter(email=email).first()
+    if not user:
+        # Create a student account by default
+        user = User.objects.create(
+            email=email,
+            name=(token_info.get('name') or email.split('@')[0])[:255],
+            password=make_password(os.urandom(24).hex()),
+            role='student',
+            status='active',
+            is_active=True,
+            is_superadmin=False,
+        )
+
+    effective_role = user.role
+    if getattr(user, 'is_superadmin', False) and effective_role != 'superadmin':
+        effective_role = 'superadmin'
+
+    token = jwt.encode(
+        {
+            'userId': user.id,
+            'exp': timezone.now() + timedelta(days=7),
+        },
+        settings.JWT_SECRET,
+        algorithm='HS256',
+    )
+
+    return Response(
+        {
+            'success': True,
+            'token': token,
+            'user': {
+                'id': user.id,
+                'email': user.email,
+                'name': user.name,
+                'role': effective_role,
+                'is_active': user.is_active,
+                'is_superadmin': user.is_superadmin,
+                'group_id': user.group_id,
+            },
+        },
+        status=200,
+    )
+
+
+@api_view(['GET', 'PUT'])
+@permission_classes([IsAuthenticated])
+@parser_classes([MultiPartParser, FormParser])
+def profile_me(request):
+    user = request.user
+
+    if request.method == 'GET':
+        return Response(
+            {
+                'success': True,
+                'user': {
+                    'id': user.id,
+                    'email': user.email,
+                    'name': user.name,
+                    'first_name': user.first_name or '',
+                    'last_name': user.last_name or '',
+                    'birth_date': user.birth_date.isoformat() if user.birth_date else None,
+                    'registration_address': user.registration_address or '',
+                    'avatar_url': user.avatar_url or '',
+                    'role': user.role,
+                    'is_superadmin': bool(getattr(user, 'is_superadmin', False)),
+                },
+            },
+            status=200,
+        )
+
+    first_name = request.data.get('first_name')
+    last_name = request.data.get('last_name')
+    birth_date_raw = request.data.get('birth_date')
+    registration_address = request.data.get('registration_address')
+    name = request.data.get('name')
+    email = request.data.get('email')
+
+    if first_name is not None:
+        user.first_name = str(first_name).strip() or None
+    if last_name is not None:
+        user.last_name = str(last_name).strip() or None
+    if registration_address is not None:
+        user.registration_address = str(registration_address).strip() or None
+
+    if birth_date_raw is not None:
+        parsed = parse_date(str(birth_date_raw))
+        user.birth_date = parsed
+
+    if name is not None and str(name).strip():
+        user.name = str(name).strip()
+    else:
+        # If explicit name wasn't sent, derive from first/last when available
+        derived = " ".join([part for part in [user.first_name or '', user.last_name or ''] if part]).strip()
+        if derived:
+            user.name = derived
+
+    if email is not None:
+        next_email = str(email).strip().lower()
+        if next_email and next_email != user.email:
+            if _effective_role(user) != 'superadmin':
+                # Student/admin cannot change their email
+                pass
+            else:
+                if User.objects.exclude(id=user.id).filter(email=next_email).exists():
+                    return Response({'success': False, 'error': 'Email вже існує.'}, status=400)
+                user.email = next_email
+
+    avatar_file = request.FILES.get('avatar')
+    remove_avatar = str(request.data.get('remove_avatar', '')).lower() in ('true', '1', 'yes')
+    if remove_avatar:
+        user.avatar_url = None
+    if avatar_file:
+        safe_name = get_valid_filename(getattr(avatar_file, 'name', 'avatar'))
+        path = default_storage.save(f"avatars/{user.id}/{safe_name}", avatar_file)
+        user.avatar_url = f"{settings.MEDIA_URL}{path}"
+
+    user.save()
+    return Response({'success': True}, status=200)
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def profile_change_password(request):
+    user = request.user
+
+    current_password = request.data.get('current_password')
+    new_password = request.data.get('new_password')
+
+    if not current_password or not new_password:
+        return Response({'success': False, 'error': 'Поточний та новий пароль обовʼязкові'}, status=400)
+
+    if not check_password(str(current_password), user.password):
+        return Response({'success': False, 'error': 'Невірний поточний пароль'}, status=400)
+
+    if len(str(new_password)) < 6:
+        return Response({'success': False, 'error': 'Пароль має бути не менше 6 символів'}, status=400)
+
+    user.password = make_password(str(new_password))
+    user.save()
+    return Response({'success': True}, status=200)
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def profile_detail(request, pk):
+    viewer = request.user
+    if getattr(viewer, 'role', None) not in ('admin', 'superadmin'):
+        return Response({'detail': 'Forbidden'}, status=403)
+
+    try:
+        target = User.objects.select_related('group').get(id=pk)
+    except User.DoesNotExist:
+        return Response({'success': False, 'error': 'Користувача не знайдено'}, status=404)
+
+    if getattr(target, 'is_superadmin', False) and getattr(viewer, 'role', None) != 'superadmin':
+        return Response({'detail': 'Forbidden'}, status=403)
+
+    return Response(
+        {
+            'success': True,
+            'user': {
+                'id': target.id,
+                'email': target.email,
+                'name': target.name,
+                'first_name': target.first_name or '',
+                'last_name': target.last_name or '',
+                'birth_date': target.birth_date.isoformat() if target.birth_date else None,
+                'registration_address': target.registration_address or '',
+                'avatar_url': target.avatar_url or '',
+                'role': target.role,
+                'is_superadmin': bool(getattr(target, 'is_superadmin', False)),
+                'group': {
+                    'id': target.group.id,
+                    'name': target.group.name,
+                    'color': target.group.color,
+                } if target.group else None,
+            },
+        },
+        status=200,
+    )
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def admin_recent_activity(request):
+    """Return a unified feed of recent activity for the admin dashboard."""
+    if getattr(request.user, 'role', None) not in ('admin', 'superadmin'):
+        return Response({'detail': 'Forbidden'}, status=403)
+
+    group_id_raw = request.query_params.get('group_id')
+    group_id = int(group_id_raw) if group_id_raw and str(group_id_raw).isdigit() else None
+
+    activities: list[dict] = []
+
+    def add_activity(*, type_: str, action: str, name: str, timestamp, group_obj=None):
+        if not timestamp:
+            return
+        group_payload = None
+        if group_obj is not None:
+            group_payload = {
+                'id': group_obj.id,
+                'name': group_obj.name,
+                'color': getattr(group_obj, 'color', None),
+            }
+
+        activities.append(
+            {
+                'type': type_,
+                'action': action,
+                'name': name,
+                'timestamp': timestamp.isoformat() if hasattr(timestamp, 'isoformat') else str(timestamp),
+                'group': group_payload,
+            }
+        )
+
+    students_qs = User.objects.filter(role='student').select_related('group').order_by('-created_at')
+    if group_id is not None:
+        students_qs = students_qs.filter(group_id=group_id)
+    for student in students_qs[:10]:
+        add_activity(
+            type_='student',
+            action='created',
+            name=student.name,
+            timestamp=student.created_at,
+            group_obj=student.group,
+        )
+
+    groups_qs = Group.objects.all().order_by('-created_at')
+    if group_id is not None:
+        groups_qs = groups_qs.filter(id=group_id)
+    for group in groups_qs[:10]:
+        add_activity(
+            type_='group',
+            action='created',
+            name=group.name,
+            timestamp=group.created_at,
+            group_obj=group,
+        )
+
+    lessons_qs = Lesson.objects.select_related('group').order_by('-created_at')
+    if group_id is not None:
+        lessons_qs = lessons_qs.filter(group_id=group_id)
+    for lesson in lessons_qs[:10]:
+        add_activity(
+            type_='lesson',
+            action='created',
+            name=lesson.title,
+            timestamp=lesson.created_at,
+            group_obj=lesson.group,
+        )
+
+    tasks_qs = Task.objects.select_related('group').order_by('-created_at')
+    if group_id is not None:
+        tasks_qs = tasks_qs.filter(group_id=group_id)
+    for task in tasks_qs[:10]:
+        add_activity(
+            type_='task',
+            action='created',
+            name=task.title,
+            timestamp=task.created_at,
+            group_obj=task.group,
+        )
+
+    if group_id is None:
+        for news in News.objects.order_by('-created_at')[:10]:
+            add_activity(
+                type_='news',
+                action='created',
+                name=news.title,
+                timestamp=news.created_at,
+                group_obj=None,
+            )
+
+    activities.sort(key=lambda a: a.get('timestamp', ''), reverse=True)
+    return Response(activities[:50])
 
 
 # ===== STUDENTS =====
 
 @api_view(['GET', 'POST'])
-@permission_classes([AllowAny])
+@permission_classes([IsAuthenticated])
 def students_list(request):
+    forbidden = _require_roles(request, ('admin', 'superadmin'))
+    if forbidden:
+        return forbidden
     if request.method == 'POST':
         name = request.data.get('name', '').strip()
         email = request.data.get('email', '').strip().lower()
@@ -398,17 +829,26 @@ def students_list(request):
         }, status=201)
 
     # --- Ось тут має бути визначення students!
-    students = User.objects.filter(role='student')
+    students = User.objects.select_related('group').filter(role='student')
     return Response([{
         "id": u.id,
         "name": u.name,
         "email": u.email,
         "is_active": u.is_active
+        ,
+        "group": {
+            "id": u.group.id,
+            "name": u.group.name,
+            "color": u.group.color,
+        } if getattr(u, 'group', None) else None,
     } for u in students])
 
 @api_view(['GET', 'PUT', 'DELETE'])
-@permission_classes([AllowAny])
+@permission_classes([IsAuthenticated])
 def student_detail(request, pk):
+    forbidden = _require_roles(request, ('admin', 'superadmin'))
+    if forbidden:
+        return forbidden
     try:
         student = User.objects.get(id=pk, role='student')
     except User.DoesNotExist:
@@ -450,8 +890,11 @@ def student_detail(request, pk):
 # ===== GROUPS =====
 
 @api_view(['POST'])
-@permission_classes([AllowAny])
+@permission_classes([IsAuthenticated])
 def group_add_students(request, pk):
+    forbidden = _require_roles(request, ('admin', 'superadmin'))
+    if forbidden:
+        return forbidden
     """Додати студентів до групи"""
     try:
         group = Group.objects.get(id=pk)
@@ -480,8 +923,11 @@ def group_add_students(request, pk):
 
 
 @api_view(['POST'])
-@permission_classes([AllowAny])
+@permission_classes([IsAuthenticated])
 def group_remove_student(request, pk):
+    forbidden = _require_roles(request, ('admin', 'superadmin'))
+    if forbidden:
+        return forbidden
     """Видалити студента з групи"""
     try:
         group = Group.objects.get(id=pk)
@@ -502,9 +948,12 @@ def group_remove_student(request, pk):
 
 
 @api_view(['GET', 'POST'])
-@permission_classes([AllowAny])
+@permission_classes([IsAuthenticated])
 def groups_list(request):
+    role = _effective_role(getattr(request, 'user', None))
     if request.method == 'POST':
+        if role not in ('admin', 'superadmin'):
+            return Response({'detail': 'Forbidden'}, status=403)
         name = request.data.get('name', '')
         description = request.data.get('description', '')
         color = request.data.get('color', '#7c3aed')
@@ -526,14 +975,22 @@ def groups_list(request):
         }, status=201)
 
     groups = Group.objects.all()
+    if role == 'student':
+        if getattr(request.user, 'group_id', None):
+            groups = groups.filter(id=request.user.group_id)
+        else:
+            groups = groups.none()
+
     result = []
     for group in groups:
-        group_students = GroupStudent.objects.filter(group=group).select_related('student')
-        students_data = [{
-            'id': gs.student.id,
-            'name': gs.student.name,
-            'email': gs.student.email
-        } for gs in group_students]
+        students_data = []
+        if role in ('admin', 'superadmin'):
+            group_students = GroupStudent.objects.filter(group=group).select_related('student')
+            students_data = [{
+                'id': gs.student.id,
+                'name': gs.student.name,
+                'email': gs.student.email
+            } for gs in group_students]
 
         result.append({
             'id': group.id,
@@ -549,12 +1006,16 @@ def groups_list(request):
 
 
 @api_view(['GET', 'PUT', 'DELETE'])
-@permission_classes([AllowAny])
+@permission_classes([IsAuthenticated])
 def group_detail(request, pk):
+    role = _effective_role(getattr(request, 'user', None))
     try:
         group = Group.objects.get(id=pk)
     except Group.DoesNotExist:
         return Response({'success': False, 'error': 'Група не знайдена'}, status=404)
+
+    if role == 'student' and getattr(request.user, 'group_id', None) != group.id:
+        return Response({'detail': 'Forbidden'}, status=403)
 
     if request.method == 'GET':
         group_students = GroupStudent.objects.filter(group=group).select_related('student')
@@ -575,6 +1036,8 @@ def group_detail(request, pk):
         })
 
     if request.method == 'PUT':
+        if role not in ('admin', 'superadmin'):
+            return Response({'detail': 'Forbidden'}, status=403)
         group.name = request.data.get('name', group.name)
         group.description = request.data.get('description', group.description)
         group.color = request.data.get('color', group.color)
@@ -601,13 +1064,18 @@ def group_detail(request, pk):
         })
 
     if request.method == 'DELETE':
+        if role not in ('admin', 'superadmin'):
+            return Response({'detail': 'Forbidden'}, status=403)
         group.delete()
         return Response({'success': True})
 
 
 @api_view(['GET'])
-@permission_classes([AllowAny])
+@permission_classes([IsAuthenticated])
 def group_students(request, pk):
+    forbidden = _require_roles(request, ('admin', 'superadmin'))
+    if forbidden:
+        return forbidden
     try:
         group = Group.objects.get(id=pk)
     except Group.DoesNotExist:
@@ -624,9 +1092,12 @@ def group_students(request, pk):
 # ===== SUBJECTS =====
 
 @api_view(['GET', 'POST'])
-@permission_classes([AllowAny])
+@permission_classes([IsAuthenticated])
 def subjects_list(request):
+    role = _effective_role(getattr(request, 'user', None))
     if request.method == 'POST':
+        if role not in ('admin', 'superadmin'):
+            return Response({'detail': 'Forbidden'}, status=403)
         name = request.data.get('name', '')
         short_name = request.data.get('short_name', '')
         if not name or not short_name:
@@ -644,8 +1115,9 @@ def subjects_list(request):
 
 
 @api_view(['GET', 'PUT', 'DELETE'])
-@permission_classes([AllowAny])
+@permission_classes([IsAuthenticated])
 def subject_detail(request, pk):
+    role = _effective_role(getattr(request, 'user', None))
     try:
         subject = Subject.objects.get(id=pk)
     except Subject.DoesNotExist:
@@ -654,11 +1126,15 @@ def subject_detail(request, pk):
         return Response({'id': subject.id, 'name': subject.name, 'short_name': subject.short_name,
                          'description': subject.description, 'color': subject.color})
     if request.method == 'PUT':
+        if role not in ('admin', 'superadmin'):
+            return Response({'detail': 'Forbidden'}, status=403)
         subject.name = request.data.get('name', subject.name)
         subject.short_name = request.data.get('short_name', subject.short_name)
         subject.save()
         return Response({'success': True})
     if request.method == 'DELETE':
+        if role not in ('admin', 'superadmin'):
+            return Response({'detail': 'Forbidden'}, status=403)
         subject.delete()
         return Response({'success': True})
 
@@ -666,9 +1142,12 @@ def subject_detail(request, pk):
 # ===== LESSONS =====
 
 @api_view(['GET', 'POST'])
-@permission_classes([AllowAny])
+@permission_classes([IsAuthenticated])
 def lessons_list(request):
+    role = _effective_role(getattr(request, 'user', None))
     if request.method == 'POST':
+        if role not in ('admin', 'superadmin'):
+            return Response({'detail': 'Forbidden'}, status=403)
         # Валідація обов'язкових полів
         if not request.data.get('title'):
             return Response({
@@ -767,6 +1246,11 @@ def lessons_list(request):
 
     # GET - повертаємо всі уроки
     lessons = Lesson.objects.select_related('subject', 'group').all().order_by('-date', '-start_time')
+    if role == 'student':
+        if getattr(request.user, 'group_id', None):
+            lessons = lessons.filter(group_id=request.user.group_id)
+        else:
+            lessons = lessons.none()
     result = []
 
     for lesson in lessons:
@@ -804,12 +1288,16 @@ def lessons_list(request):
 
 
 @api_view(['GET', 'PUT', 'DELETE'])
-@permission_classes([AllowAny])
+@permission_classes([IsAuthenticated])
 def lesson_detail(request, pk):
+    role = _effective_role(getattr(request, 'user', None))
     try:
         lesson = Lesson.objects.select_related('subject', 'group').get(id=pk)
     except Lesson.DoesNotExist:
         return Response({'success': False, 'error': 'Урок не знайдено'}, status=404)
+
+    if role == 'student' and getattr(request.user, 'group_id', None) != getattr(lesson, 'group_id', None):
+        return Response({'detail': 'Forbidden'}, status=403)
 
     if request.method == 'GET':
         return Response({
@@ -835,6 +1323,8 @@ def lesson_detail(request, pk):
         })
 
     if request.method == 'PUT':
+        if role not in ('admin', 'superadmin'):
+            return Response({'detail': 'Forbidden'}, status=403)
         lesson.title = request.data.get('title', lesson.title)
         lesson.description = request.data.get('description', lesson.description)
         lesson.meeting_link = request.data.get('meeting_link', lesson.meeting_link)
@@ -870,30 +1360,17 @@ def lesson_detail(request, pk):
         return Response({'success': True})
 
     if request.method == 'DELETE':
-        lesson.delete()
-        return Response({'success': True})
-
-
-@api_view(['GET', 'PUT', 'DELETE'])
-def lesson_detail(request, pk):
-    try:
-        lesson = Lesson.objects.get(id=pk)
-    except Lesson.DoesNotExist:
-        return Response({'success': False, 'error': 'Урок не знайдений'}, status=404)
-    if request.method == 'GET':
-        return Response(
-            {'id': lesson.id, 'title': lesson.title, 'description': lesson.description, 'status': lesson.status})
-    if request.method == 'PUT':
-        lesson.title = request.data.get('title', lesson.title)
-        lesson.save()
-        return Response({'success': True})
-    if request.method == 'DELETE':
+        if role not in ('admin', 'superadmin'):
+            return Response({'detail': 'Forbidden'}, status=403)
         lesson.delete()
         return Response({'success': True})
 
 
 @api_view(['GET'])
 def lesson_grades(request, pk):
+    forbidden = _require_roles(request, ('admin', 'superadmin'))
+    if forbidden:
+        return forbidden
     try:
         lesson = Lesson.objects.get(id=pk)
         grades = LessonGrade.objects.filter(lesson=lesson)
@@ -905,12 +1382,16 @@ def lesson_grades(request, pk):
 
 # ===== TASKS =====
 @api_view(['GET', 'PUT', 'DELETE'])
-@permission_classes([AllowAny])
+@permission_classes([IsAuthenticated])
 def task_detail(request, pk):
+    role = _effective_role(getattr(request, 'user', None))
     try:
         task = Task.objects.get(id=pk)
     except Task.DoesNotExist:
         return Response({'success': False, 'error': 'Завдання не знайдено'}, status=404)
+
+    if role == 'student' and getattr(request.user, 'group_id', None) != getattr(task, 'group_id', None):
+        return Response({'detail': 'Forbidden'}, status=403)
 
     if request.method == 'GET':
         return Response({
@@ -923,7 +1404,15 @@ def task_detail(request, pk):
             'created_at': task.created_at
         })
 
+    if request.method == 'DELETE':
+        if role not in ('admin', 'superadmin'):
+            return Response({'detail': 'Forbidden'}, status=403)
+        task.delete()
+        return Response({'success': True})
+
     if request.method == 'PUT':
+        if role not in ('admin', 'superadmin'):
+            return Response({'detail': 'Forbidden'}, status=403)
         task.title = request.data.get('title', task.title)
         task.description = request.data.get('description', task.description)
         task.type = request.data.get('type', task.type)
@@ -949,41 +1438,14 @@ def task_detail(request, pk):
         task.save()
         return Response({'success': True})
 
-@api_view(['GET', 'PUT', 'DELETE'])
-@permission_classes([AllowAny])
-def task_detail(request, pk):
-    try:
-        task = Task.objects.get(id=pk)
-    except Task.DoesNotExist:
-        return Response({'success': False, 'error': 'Завдання не знайдено'}, status=404)
-
-    if request.method == 'GET':
-        return Response({
-            'id': task.id,
-            'title': task.title,
-            'description': task.description,
-            'type': task.type,
-            'due_date': task.due_date,
-            'created_at': task.created_at
-        })
-
-    if request.method == 'PUT':
-        task.title = request.data.get('title', task.title)
-        task.description = request.data.get('description', task.description)
-        task.type = request.data.get('type', task.type)
-        task.due_date = request.data.get('due_date', task.due_date)
-        task.save()
-        return Response({'success': True})
-
-    if request.method == 'DELETE':
-        task.delete()
-        return Response({'success': True})
-
 
 @api_view(['GET', 'POST'])
-@permission_classes([AllowAny])
+@permission_classes([IsAuthenticated])
 def tasks_list(request):
+    role = _effective_role(getattr(request, 'user', None))
     if request.method == 'POST':
+        if role not in ('admin', 'superadmin'):
+            return Response({'detail': 'Forbidden'}, status=403)
         # POST код залишається без змін
         title = request.data.get('title', '')
         if not title:
@@ -1049,6 +1511,11 @@ def tasks_list(request):
 
     # GET - повертаємо всі завдання з повною інформацією
     tasks = Task.objects.select_related('subject', 'group').all()
+    if role == 'student':
+        if getattr(request.user, 'group_id', None):
+            tasks = tasks.filter(group_id=request.user.group_id)
+        else:
+            tasks = tasks.none()
     result = []
 
     for task in tasks:
@@ -1087,8 +1554,11 @@ def tasks_list(request):
 
 
 @api_view(['POST'])
-@permission_classes([AllowAny])
+@permission_classes([IsAuthenticated])
 def tasks_bulk_create(request):
+    forbidden = _require_roles(request, ('admin', 'superadmin'))
+    if forbidden:
+        return forbidden
     """Масове створення завдань для кількох груп"""
     title = request.data.get('title', '')
     description = request.data.get('description', '')
@@ -1153,15 +1623,79 @@ def tasks_bulk_create(request):
         'tasks': created_tasks
     }, status=201)
 
-@api_view(['GET'])
+@api_view(['GET', 'POST'])
+@permission_classes([IsAuthenticated])
+@parser_classes([MultiPartParser, FormParser])
 def task_submissions(request, pk):
+    role = _effective_role(getattr(request, 'user', None))
     try:
-        task = Task.objects.get(id=pk)
-        submissions = task.submissions.all()
-        return Response(
-            [{'id': s.id, 'student': s.student.name, 'status': s.status, 'grade': s.grade} for s in submissions])
+        task = Task.objects.select_related('group').get(id=pk)
     except Task.DoesNotExist:
         return Response({'success': False, 'error': 'Завдання не знайдено'}, status=404)
+
+    if role == 'student' and getattr(request.user, 'group_id', None) != getattr(task, 'group_id', None):
+        return Response({'detail': 'Forbidden'}, status=403)
+
+    if request.method == 'POST':
+        if role != 'student':
+            return Response({'detail': 'Forbidden'}, status=403)
+
+        comment = str(request.data.get('comment', '') or '').strip() or None
+        submission, _created = TaskSubmission.objects.get_or_create(
+            task=task,
+            student=request.user,
+            defaults={'status': 'submitted', 'comment': comment, 'submitted_at': timezone.now()},
+        )
+        submission.comment = comment
+        submission.status = 'submitted'
+        submission.submitted_at = timezone.now()
+        submission.save()
+
+        files = []
+        try:
+            files = request.FILES.getlist('files')
+        except Exception:
+            files = []
+
+        saved_files = []
+        for f in files:
+            safe_name = get_valid_filename(getattr(f, 'name', 'file'))
+            stored_path = default_storage.save(f"submissions/{task.id}/{submission.id}/{safe_name}", f)
+            url = f"{settings.MEDIA_URL}{stored_path}"
+            file_rec = SubmissionFile.objects.create(
+                submission=submission,
+                file_name=safe_name,
+                file_url=url,
+                file_size=str(getattr(f, 'size', '') or ''),
+                file_type=str(getattr(f, 'content_type', '') or 'file')[:20],
+            )
+            saved_files.append({'id': file_rec.id, 'name': file_rec.file_name, 'url': file_rec.file_url, 'size': file_rec.file_size})
+
+        return Response({'success': True, 'submission': {'id': submission.id, 'status': submission.status, 'files': saved_files}}, status=201)
+
+    submissions_qs = TaskSubmission.objects.select_related('student').filter(task=task)
+    if role == 'student':
+        submissions_qs = submissions_qs.filter(student=request.user)
+        return Response([
+            {
+                'id': s.id,
+                'status': s.status,
+                'grade': s.grade,
+                'comment': s.comment,
+                'submitted_at': s.submitted_at,
+                'files': [
+                    {'id': f.id, 'name': f.file_name, 'url': f.file_url, 'size': f.file_size, 'type': f.file_type}
+                    for f in s.files.all()
+                ],
+            }
+            for s in submissions_qs
+        ])
+
+    if role not in ('admin', 'superadmin'):
+        return Response({'detail': 'Forbidden'}, status=403)
+    return Response(
+        [{'id': s.id, 'student': s.student.name, 'status': s.status, 'grade': s.grade} for s in submissions_qs]
+    )
 
 
 @api_view(['POST'])
@@ -1173,6 +1707,9 @@ def grade_submission(request, pk):
 
 @api_view(['GET'])
 def grades_list(request):
+    forbidden = _require_roles(request, ('admin', 'superadmin'))
+    if forbidden:
+        return forbidden
     grades = LessonGrade.objects.all()
     return Response(
         [{'id': g.id, 'student': g.student.name, 'lesson': g.lesson.title, 'grade': g.grade} for g in grades])
@@ -1181,9 +1718,12 @@ def grades_list(request):
 # ===== ATTENDANCE =====
 
 @api_view(['GET', 'POST'])
-@permission_classes([AllowAny])
+@permission_classes([IsAuthenticated])
 def attendance_list(request):
+    role = _effective_role(getattr(request, 'user', None))
     if request.method == 'POST':
+        if role not in ('admin', 'superadmin'):
+            return Response({'detail': 'Forbidden'}, status=403)
         # Валідація обов'язкових полів
         if not request.data.get('lesson_id'):
             return Response({
@@ -1253,6 +1793,10 @@ def attendance_list(request):
 
     # GET - повертаємо всі записи
     attendance_records = Attendance.objects.select_related('lesson', 'user', 'lesson__group', 'lesson__subject').all()
+    if role == 'student':
+        attendance_records = attendance_records.filter(user=request.user)
+    elif role not in ('admin', 'superadmin'):
+        return Response({'detail': 'Forbidden'}, status=403)
     result = []
 
     for record in attendance_records:
@@ -1288,12 +1832,18 @@ def attendance_list(request):
 
 
 @api_view(['GET', 'PUT', 'DELETE'])
-@permission_classes([AllowAny])
+@permission_classes([IsAuthenticated])
 def attendance_detail(request, pk):
+    role = _effective_role(getattr(request, 'user', None))
     try:
         attendance = Attendance.objects.select_related('lesson', 'user').get(id=pk)
     except Attendance.DoesNotExist:
         return Response({'success': False, 'error': 'Запис не знайдено'}, status=404)
+
+    if role == 'student' and attendance.user_id != request.user.id:
+        return Response({'detail': 'Forbidden'}, status=403)
+    if role not in ('admin', 'superadmin', 'student'):
+        return Response({'detail': 'Forbidden'}, status=403)
 
     if request.method == 'GET':
         return Response({
@@ -1305,24 +1855,32 @@ def attendance_detail(request, pk):
         })
 
     if request.method == 'PUT':
+        if role not in ('admin', 'superadmin'):
+            return Response({'detail': 'Forbidden'}, status=403)
         attendance.status = request.data.get('status', attendance.status)
         attendance.notes = request.data.get('notes', attendance.notes)
         attendance.save()
         return Response({'success': True})
 
     if request.method == 'DELETE':
+        if role not in ('admin', 'superadmin'):
+            return Response({'detail': 'Forbidden'}, status=403)
         attendance.delete()
         return Response({'success': True})
 
 
 @api_view(['GET'])
-@permission_classes([AllowAny])
-def attendance_by_lesson(request):
+@permission_classes([IsAuthenticated])
+def attendance_by_lesson(request, lesson_id=None):
     """
     GET /api/attendance/?lesson_id=XXX
     Повернути {lesson, students: [user, attendance]}
     """
-    lesson_id = request.query_params.get('lesson_id')
+    forbidden = _require_roles(request, ('admin', 'superadmin'))
+    if forbidden:
+        return forbidden
+
+    lesson_id = lesson_id or request.query_params.get('lesson_id')
     if not lesson_id:
         return Response({'success': False, 'error': 'Потрібен lesson_id'}, status=400)
 
@@ -1366,6 +1924,36 @@ def attendance_by_lesson(request):
         'students': result,
     })
 
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def attendance_my(request):
+    role = _effective_role(getattr(request, 'user', None))
+    if role != 'student':
+        return Response({'detail': 'Forbidden'}, status=403)
+
+    month = str(request.query_params.get('month', '') or '').strip()  # YYYY-MM
+    if month and len(month) != 7:
+        month = ''
+
+    qs = Attendance.objects.select_related('lesson').filter(user=request.user)
+    if month:
+        qs = qs.filter(lesson__date__startswith=month)
+
+    return Response([
+        {
+            'id': a.id,
+            'status': a.status,
+            'notes': a.notes or '',
+            'lesson': {
+                'id': a.lesson_id,
+                'title': a.lesson.title,
+                'date': a.lesson.date.isoformat() if a.lesson.date else '',
+            },
+        }
+        for a in qs.order_by('-lesson__date')
+    ])
+
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def attendance_bulk_update(request):
@@ -1397,24 +1985,72 @@ def attendance_bulk_update(request):
 
 # ===== INVOICES =====
 
-@api_view(['GET'])
+@api_view(['GET', 'POST'])
+@permission_classes([IsAuthenticated])
 def invoices_list(request):
-    invoices = Invoice.objects.all()
-    return Response(
-        [{'id': i.id, 'student': i.student.name, 'amount': str(i.amount), 'status': i.status} for i in invoices])
+    role = _effective_role(getattr(request, 'user', None))
+
+    if request.method == 'POST':
+        if role not in ('admin', 'superadmin'):
+            return Response({'detail': 'Forbidden'}, status=403)
+        return create_invoice(request)
+
+    invoices_qs = Invoice.objects.select_related('student').order_by('-created_at').all()
+    if role == 'student':
+        invoices_qs = invoices_qs.filter(student=request.user)
+    elif role not in ('admin', 'superadmin'):
+        return Response({'detail': 'Forbidden'}, status=403)
+
+    data = []
+    for i in invoices_qs:
+        data.append({
+            'id': i.id,
+            'studentId': i.student.id,
+            'studentName': i.student.name,
+            'studentEmail': i.student.email,
+            'amount': float(i.amount),
+            'paidAmount': float(i.paid_amount),
+            'installments': i.installments,
+            'currentInstallment': i.current_installment,
+            'status': i.status,
+            'dueDate': i.due_date.isoformat() if i.due_date else '',
+            'createdAt': i.created_at.isoformat() if i.created_at else '',
+            'description': i.description or '',
+            'latestReceipt': None,
+        })
+    return Response(data)
 
 
 @api_view(['GET'])
+@permission_classes([IsAuthenticated])
 def invoices_history(request):
-    invoices = Invoice.objects.all()
-    return Response([{'id': i.id, 'student': i.student.name, 'amount': str(i.amount), 'paid_amount': str(i.paid_amount),
-                      'status': i.status} for i in invoices])
+    forbidden = _require_roles(request, ('admin', 'superadmin'))
+    if forbidden:
+        return forbidden
+    invoices = Invoice.objects.select_related('student').order_by('-created_at').all()
+    return Response([
+        {
+            'id': i.id,
+            'studentId': i.student.id,
+            'studentName': i.student.name,
+            'studentEmail': i.student.email,
+            'amount': float(i.amount),
+            'paidAmount': float(i.paid_amount),
+            'status': i.status,
+            'dueDate': i.due_date.isoformat() if i.due_date else '',
+            'createdAt': i.created_at.isoformat() if i.created_at else '',
+        }
+        for i in invoices
+    ])
 
 
 # ===== ADMIN & STATS =====
 
 @api_view(['GET'])
 def admin_stats(request):
+    forbidden = _require_roles(request, ('admin', 'superadmin'))
+    if forbidden:
+        return forbidden
     return Response(
         {'students': User.objects.filter(role='student').count(), 'admins': User.objects.filter(role='admin').count(),
          'groups': Group.objects.count()})
@@ -1422,17 +2058,35 @@ def admin_stats(request):
 
 @api_view(['GET'])
 def leaderboard(request):
-    points = StudentPoint.objects.values('student__name').annotate(total=sum('points')).order_by('-total')[:10]
-    return Response(list(points))
+    forbidden = _require_roles(request, ('admin', 'superadmin', 'student'))
+    if forbidden:
+        return forbidden
+    points = (
+        StudentPoint.objects.values('student_id', 'student__name')
+        .annotate(total=Sum('points'))
+        .order_by('-total')[:10]
+    )
+    payload = []
+    for idx, row in enumerate(points, start=1):
+        payload.append({
+            'id': row.get('student_id'),
+            'name': row.get('student__name') or f"Учень {idx}",
+            'points': row.get('total') or 0,
+            'rank': idx,
+        })
+    return Response(payload)
 
 
 # ===== NEWS =====
 
 
 @api_view(['GET', 'POST'])
-@permission_classes([AllowAny])
+@permission_classes([IsAuthenticated])
 def news_list(request):
+    role = _effective_role(getattr(request, 'user', None))
     if request.method == 'POST':
+        if role not in ('admin', 'superadmin'):
+            return Response({'detail': 'Forbidden'}, status=403)
         # --- Валідація та отримання значень ---
         title = request.data.get('title', '').strip()
         content = request.data.get('content', '').strip()
@@ -1462,7 +2116,11 @@ def news_list(request):
 
     # --- GET метод: список новин ---
     data = []
-    for n in News.objects.order_by("-created_at"):
+    news_qs = News.objects.order_by("-created_at")
+    if role == 'student':
+        news_qs = news_qs.filter(is_published=True)
+
+    for n in news_qs:
         data.append({
             'id': n.id,
             'title': n.title,
@@ -1478,12 +2136,16 @@ def news_list(request):
     return Response(data)
 
 @api_view(['GET', 'PUT', 'DELETE'])
-@permission_classes([AllowAny])
+@permission_classes([IsAuthenticated])
 def news_detail(request, pk):
+    role = _effective_role(getattr(request, 'user', None))
     try:
         news = News.objects.get(id=pk)
     except News.DoesNotExist:
         return Response({'success': False, 'error': 'Новина не знайдена'}, status=404)
+
+    if role == 'student' and not news.is_published:
+        return Response({'detail': 'Forbidden'}, status=403)
 
     if request.method == 'GET':
         # +1 до views
@@ -1502,6 +2164,8 @@ def news_detail(request, pk):
             'views_count': news.views_count,
         })
     if request.method == 'PUT':
+        if role not in ('admin', 'superadmin'):
+            return Response({'detail': 'Forbidden'}, status=403)
         news.title = request.data.get('title', news.title)
         news.content = request.data.get('content', news.content)
         news.category = request.data.get('category', news.category)
@@ -1512,16 +2176,38 @@ def news_detail(request, pk):
         news.save()
         return Response({'success': True})
     if request.method == 'DELETE':
+        if role not in ('admin', 'superadmin'):
+            return Response({'detail': 'Forbidden'}, status=403)
         news.delete()
         return Response({'success': True})
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def news_view(request, pk):
+    try:
+        news = News.objects.get(id=pk)
+    except News.DoesNotExist:
+        return Response({'success': False, 'error': 'Новина не знайдена'}, status=404)
+
+    role = _effective_role(getattr(request, 'user', None))
+    if role == 'student' and not news.is_published:
+        return Response({'detail': 'Forbidden'}, status=403)
+
+    news.views_count = (news.views_count or 0) + 1
+    news.save(update_fields=['views_count'])
+    return Response({'success': True})
 
 
 # ===== EXTRA NEWS =====
 
 @api_view(['GET', 'POST'])
-@permission_classes([AllowAny])
+@permission_classes([IsAuthenticated])
 def extra_news_list(request):
+    role = _effective_role(getattr(request, 'user', None))
     if request.method == 'POST':
+        if role not in ('admin', 'superadmin'):
+            return Response({'detail': 'Forbidden'}, status=403)
         title = request.data.get('title', '')
         if not title:
             return Response({'success': False, 'error': 'Заголовок обов\'язковий'}, status=400)
@@ -1535,7 +2221,11 @@ def extra_news_list(request):
 
 
 @api_view(['GET', 'PUT', 'DELETE'])
+@permission_classes([IsAuthenticated])
 def extra_news_detail(request, pk):
+    role = _effective_role(getattr(request, 'user', None))
+    if role not in ('admin', 'superadmin', 'student'):
+        return Response({'detail': 'Forbidden'}, status=403)
     try:
         extra_news = ExtraNews.objects.get(id=pk)
     except ExtraNews.DoesNotExist:
@@ -1544,10 +2234,14 @@ def extra_news_detail(request, pk):
         return Response({'id': extra_news.id, 'title': extra_news.title, 'description': extra_news.description,
                          'media_type': extra_news.media_type})
     if request.method == 'PUT':
+        if role not in ('admin', 'superadmin'):
+            return Response({'detail': 'Forbidden'}, status=403)
         extra_news.title = request.data.get('title', extra_news.title)
         extra_news.save()
         return Response({'success': True})
     if request.method == 'DELETE':
+        if role not in ('admin', 'superadmin'):
+            return Response({'detail': 'Forbidden'}, status=403)
         extra_news.delete()
         return Response({'success': True})
 
@@ -1555,60 +2249,194 @@ def extra_news_detail(request, pk):
 # ===== CHATS =====
 
 @api_view(['GET', 'POST'])
+@permission_classes([IsAuthenticated])
 def chats_list(request):
+    role = _effective_role(getattr(request, 'user', None))
     if request.method == 'POST':
-        name = request.data.get('name', '')
-        chat = Chat.objects.create(type='group', name=name)
+        type_raw = str(request.data.get('type', '') or '').strip().lower() or 'private'
+        if type_raw not in ('private', 'group'):
+            return Response({'success': False, 'error': 'Некоректний тип чату'}, status=400)
+
+        if type_raw == 'private':
+            participant_id = request.data.get('participant_id')
+            if not participant_id:
+                return Response({'success': False, 'error': 'participant_id обовʼязковий'}, status=400)
+            try:
+                other = User.objects.get(id=int(participant_id))
+            except (User.DoesNotExist, ValueError, TypeError):
+                return Response({'success': False, 'error': 'Користувач не знайдений'}, status=404)
+
+            # Find existing 1:1 chat
+            existing = (
+                Chat.objects.filter(type='private', participants__user=request.user)
+                .filter(participants__user=other)
+                .distinct()
+                .first()
+            )
+            if existing:
+                return Response({'success': True, 'chat': {'id': existing.id}}, status=200)
+
+            chat = Chat.objects.create(type='private', name=None, created_by=request.user)
+            ChatParticipant.objects.get_or_create(chat=chat, user=request.user)
+            ChatParticipant.objects.get_or_create(chat=chat, user=other)
+            return Response({'success': True, 'chat': {'id': chat.id}}, status=201)
+
+        # group chat
+        if role not in ('admin', 'superadmin'):
+            return Response({'detail': 'Forbidden'}, status=403)
+
+        name = str(request.data.get('name', '') or '').strip() or None
+        participant_ids = request.data.get('participant_ids')
+        if not isinstance(participant_ids, list) or len(participant_ids) == 0:
+            return Response({'success': False, 'error': 'participant_ids має бути непорожнім списком'}, status=400)
+
+        chat = Chat.objects.create(type='group', name=name, created_by=request.user)
+        ChatParticipant.objects.get_or_create(chat=chat, user=request.user)
+        for pid in participant_ids:
+            try:
+                u = User.objects.get(id=int(pid))
+                ChatParticipant.objects.get_or_create(chat=chat, user=u)
+            except Exception:
+                continue
+
         return Response({'success': True, 'chat': {'id': chat.id, 'name': chat.name}}, status=201)
-    chats = Chat.objects.all()
-    return Response([{'id': c.id, 'name': c.name, 'type': c.type} for c in chats])
+
+    chats_qs = Chat.objects.all()
+    if role not in ('admin', 'superadmin'):
+        chats_qs = chats_qs.filter(participants__user=request.user).distinct()
+
+    result = []
+    for c in chats_qs.order_by('-created_at'):
+        participants = (
+            User.objects.filter(chat_participations__chat=c)
+            .only('id', 'name', 'email')
+            .all()
+        )
+        result.append({
+            'id': c.id,
+            'name': c.name,
+            'type': c.type,
+            'participants': [{'id': u.id, 'name': u.name, 'email': u.email} for u in participants],
+        })
+    return Response(result)
 
 
 @api_view(['GET', 'PUT', 'DELETE'])
+@permission_classes([IsAuthenticated])
 def chat_detail(request, pk):
     try:
         chat = Chat.objects.get(id=pk)
     except Chat.DoesNotExist:
         return Response({'success': False, 'error': 'Чат не знайдений'}, status=404)
+
+    role = _effective_role(getattr(request, 'user', None))
+    if role not in ('admin', 'superadmin'):
+        is_participant = ChatParticipant.objects.filter(chat=chat, user=request.user).exists()
+        if not is_participant:
+            return Response({'detail': 'Forbidden'}, status=403)
+
     if request.method == 'GET':
         return Response({'id': chat.id, 'name': chat.name, 'type': chat.type})
     if request.method == 'PUT':
+        if role not in ('admin', 'superadmin'):
+            return Response({'detail': 'Forbidden'}, status=403)
         chat.name = request.data.get('name', chat.name)
         chat.save()
         return Response({'success': True})
     if request.method == 'DELETE':
+        if role not in ('admin', 'superadmin'):
+            return Response({'detail': 'Forbidden'}, status=403)
         chat.delete()
         return Response({'success': True})
 
 
 @api_view(['GET', 'POST'])
+@permission_classes([IsAuthenticated])
+@parser_classes([MultiPartParser, FormParser])
 def chat_messages(request, pk):
     try:
         chat = Chat.objects.get(id=pk)
     except Chat.DoesNotExist:
         return Response({'success': False, 'error': 'Чат не знайдений'}, status=404)
+
+    role = _effective_role(getattr(request, 'user', None))
+    if role not in ('admin', 'superadmin'):
+        is_participant = ChatParticipant.objects.filter(chat=chat, user=request.user).exists()
+        if not is_participant:
+            return Response({'detail': 'Forbidden'}, status=403)
+
     if request.method == 'POST':
-        content = request.data.get('content', '')
-        sender_id = request.data.get('sender_id')
-        if not sender_id:
-            return Response({'success': False, 'error': 'Sender ID обов\'язковий'}, status=400)
+        content = str(request.data.get('content', '') or '')
+        message = ChatMessage.objects.create(chat=chat, sender=request.user, content=content)
+
+        files = []
         try:
-            sender = User.objects.get(id=sender_id)
-            message = ChatMessage.objects.create(chat=chat, sender=sender, content=content)
-            return Response({'success': True, 'message': {'id': message.id, 'content': message.content}}, status=201)
-        except User.DoesNotExist:
-            return Response({'success': False, 'error': 'Користувач не знайдений'}, status=404)
-    messages = chat.messages.all()
-    return Response(
-        [{'id': m.id, 'sender': m.sender.name, 'content': m.content, 'created_at': m.created_at} for m in messages])
+            files = request.FILES.getlist('files')
+        except Exception:
+            files = []
+
+        for f in files:
+            safe_name = get_valid_filename(getattr(f, 'name', 'file'))
+            stored_path = default_storage.save(f"chat_attachments/{chat.id}/{message.id}/{safe_name}", f)
+            url = f"{settings.MEDIA_URL}{stored_path}"
+            content_type = str(getattr(f, 'content_type', '') or '').lower()
+            att_type = 'file'
+            if content_type.startswith('image/'):
+                att_type = 'image'
+            elif content_type.startswith('video/'):
+                att_type = 'video'
+
+            ChatMessageAttachment.objects.create(
+                message=message,
+                type=att_type,
+                name=safe_name,
+                url=url,
+                size=str(getattr(f, 'size', '') or ''),
+            )
+
+        return Response({'success': True, 'message': {'id': message.id}}, status=201)
+
+    messages = chat.messages.select_related('sender').all()
+    payload = []
+    for m in messages:
+        attachments = []
+        try:
+            attachments = [
+                {
+                    'id': a.id,
+                    'type': a.type,
+                    'name': a.name,
+                    'url': a.url,
+                    'size': a.size,
+                }
+                for a in m.attachments.all()
+            ]
+        except Exception:
+            attachments = []
+
+        payload.append(
+            {
+                'id': m.id,
+                'sender_id': m.sender_id,
+                'sender': m.sender.name,
+                'content': m.content,
+                'created_at': m.created_at,
+                'attachments': attachments,
+            }
+        )
+
+    return Response(payload)
 
 
 # ===== POLLS =====
 
 @api_view(['GET', 'POST'])
-@permission_classes([AllowAny])
+@permission_classes([IsAuthenticated])
 def polls_list(request):
+    role = _effective_role(getattr(request, 'user', None))
     if request.method == 'POST':
+        if role not in ('admin', 'superadmin'):
+            return Response({'detail': 'Forbidden'}, status=403)
         title = request.data.get('title')
         options = request.data.get('options', [])
         target_type = request.data.get('targetType', 'all')
@@ -1649,7 +2477,15 @@ def polls_list(request):
 
     # GET — список опитувань (простий респонс, додай потрібні поля)
     result = []
-    for poll in Poll.objects.all().order_by('-created_at'):
+    polls_qs = Poll.objects.all().order_by('-created_at')
+    if role == 'student':
+        polls_qs = polls_qs.exclude(status='draft')
+        if getattr(request.user, 'group_id', None):
+            polls_qs = polls_qs.filter(models.Q(target_type='all') | models.Q(target_type='group', target_group_id=request.user.group_id))
+        else:
+            polls_qs = polls_qs.filter(target_type='all')
+
+    for poll in polls_qs:
         result.append({
             'id': poll.id,
             'title': poll.title,
@@ -1667,16 +2503,58 @@ def polls_list(request):
     return Response(result)
 
 
-@api_view(['GET'])
-@permission_classes([AllowAny])
+@api_view(['GET', 'PUT', 'DELETE'])
+@permission_classes([IsAuthenticated])
 def poll_detail(request, pk):
     """
     Детальна інформація про опитування + всі варіанти і кількість голосів
     """
     try:
         poll = Poll.objects.select_related('target_group').get(id=pk)
-        options = poll.options.all()
 
+        if request.method == 'DELETE':
+            forbidden = _require_roles(request, ('admin', 'superadmin'))
+            if forbidden:
+                return forbidden
+            poll.delete()
+            return Response({'success': True})
+
+        if request.method == 'PUT':
+            forbidden = _require_roles(request, ('admin', 'superadmin'))
+            if forbidden:
+                return forbidden
+
+            poll.title = request.data.get('title', poll.title)
+            poll.description = request.data.get('description', poll.description)
+            poll.target_type = request.data.get('targetType', poll.target_type)
+            poll.is_anonymous = bool(request.data.get('isAnonymous', poll.is_anonymous))
+            poll.is_multiple_choice = bool(request.data.get('isMultipleChoice', poll.is_multiple_choice))
+            ends_at = request.data.get('endsAt')
+            if ends_at:
+                poll.ends_at = ends_at
+
+            group_ids = request.data.get('groupIds', [])
+            if poll.target_type == 'group' and isinstance(group_ids, list) and len(group_ids) > 0:
+                try:
+                    poll.target_group = Group.objects.get(id=int(group_ids[0]))
+                except Exception:
+                    poll.target_group = None
+            else:
+                poll.target_group = None
+
+            poll.save()
+
+            options = request.data.get('options', [])
+            if isinstance(options, list) and len(options) >= 2:
+                poll.options.all().delete()
+                for o in options:
+                    text = (o.get('text') if isinstance(o, dict) else None) or ''
+                    if str(text).strip():
+                        PollOption.objects.create(poll=poll, text=str(text).strip())
+
+            return Response({'success': True})
+
+        options = poll.options.all()
         options_data = []
         for option in options:
             votes_count = option.votes.count() if hasattr(option, 'votes') else 0
@@ -1703,17 +2581,17 @@ def poll_detail(request, pk):
         return Response({'success': False, 'error': 'Опитування не знайдене'}, status=404)
 
 @api_view(['POST'])
-@permission_classes([AllowAny])
+@permission_classes([IsAuthenticated])
 def poll_vote(request, pk):
     """
     Додати голосування: pk - option.id, student_id в тілі
     """
     try:
         option = PollOption.objects.get(id=pk)
-        student_id = request.data.get('student_id')
-        if not student_id:
-            return Response({'success': False, 'error': 'Student ID обов\'язковий'}, status=400)
-        student = User.objects.get(id=student_id)
+        role = _effective_role(getattr(request, 'user', None))
+        if role != 'student':
+            return Response({'detail': 'Forbidden'}, status=403)
+        student = request.user
 
         # Захист від подвійного голосу:
         if PollVote.objects.filter(option=option, student=student).exists():
@@ -1724,12 +2602,30 @@ def poll_vote(request, pk):
     except (PollOption.DoesNotExist, User.DoesNotExist):
         return Response({'success': False, 'error': 'Not found (option or student)'}, status=404)
 
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def poll_close(request, pk):
+    forbidden = _require_roles(request, ('admin', 'superadmin'))
+    if forbidden:
+        return forbidden
+    try:
+        poll = Poll.objects.get(id=pk)
+    except Poll.DoesNotExist:
+        return Response({'success': False, 'error': 'Опитування не знайдене'}, status=404)
+    poll.status = 'closed'
+    poll.save(update_fields=['status'])
+    return Response({'success': True})
+
 # ===== COURSES =====
 
 @api_view(['GET', 'POST'])
-@permission_classes([AllowAny])
+@permission_classes([IsAuthenticated])
 def courses_list(request):
+    role = _effective_role(getattr(request, 'user', None))
     if request.method == 'POST':
+        if role not in ('admin', 'superadmin'):
+            return Response({'detail': 'Forbidden'}, status=403)
         title = request.data.get('title', '')
         if not title:
             return Response({'success': False, 'error': 'Назва курсу обов\'язкова'}, status=400)
@@ -1772,6 +2668,12 @@ def courses_list(request):
 
     # GET
     courses = Course.objects.select_related('group', 'subject').all()
+    if role == 'student':
+        courses = courses.filter(is_published=True)
+        if getattr(request.user, 'group_id', None):
+            courses = courses.filter(models.Q(group__isnull=True) | models.Q(group_id=request.user.group_id))
+        else:
+            courses = courses.filter(group__isnull=True)
     result = []
 
     for course in courses:
@@ -1809,12 +2711,19 @@ def courses_list(request):
 
 
 @api_view(['GET', 'PUT', 'DELETE'])
-@permission_classes([AllowAny])
+@permission_classes([IsAuthenticated])
 def course_detail(request, pk):
+    role = _effective_role(getattr(request, 'user', None))
     try:
         course = Course.objects.select_related('group', 'subject').get(id=pk)
     except Course.DoesNotExist:
         return Response({'success': False, 'error': 'Курс не знайдений'}, status=404)
+
+    if role == 'student':
+        if not course.is_published:
+            return Response({'detail': 'Forbidden'}, status=403)
+        if course.group_id and getattr(request.user, 'group_id', None) != course.group_id:
+            return Response({'detail': 'Forbidden'}, status=403)
 
     if request.method == 'GET':
         # Отримуємо матеріали та тести
@@ -1883,6 +2792,8 @@ def course_detail(request, pk):
         })
 
     if request.method == 'PUT':
+        if role not in ('admin', 'superadmin'):
+            return Response({'detail': 'Forbidden'}, status=403)
         course.title = request.data.get('title', course.title)
         course.description = request.data.get('description', course.description)
         course.thumbnail = request.data.get('thumbnail', course.thumbnail)
@@ -1906,13 +2817,18 @@ def course_detail(request, pk):
         return Response({'success': True})
 
     if request.method == 'DELETE':
+        if role not in ('admin', 'superadmin'):
+            return Response({'detail': 'Forbidden'}, status=403)
         course.delete()
         return Response({'success': True})
 
 
 @api_view(['POST'])
-@permission_classes([AllowAny])
+@permission_classes([IsAuthenticated])
 def course_add_material(request, pk):
+    forbidden = _require_roles(request, ('admin', 'superadmin'))
+    if forbidden:
+        return forbidden
     """Додати матеріал до курсу"""
     try:
         course = Course.objects.get(id=pk)
@@ -1953,8 +2869,11 @@ def course_add_material(request, pk):
 
 
 @api_view(['DELETE'])
-@permission_classes([AllowAny])
+@permission_classes([IsAuthenticated])
 def course_remove_material(request, course_pk, material_pk):
+    forbidden = _require_roles(request, ('admin', 'superadmin'))
+    if forbidden:
+        return forbidden
     """Видалити матеріал з курсу"""
     try:
         material = CourseMaterial.objects.get(id=material_pk, course_id=course_pk)
@@ -1965,8 +2884,11 @@ def course_remove_material(request, course_pk, material_pk):
 
 
 @api_view(['POST'])
-@permission_classes([AllowAny])
+@permission_classes([IsAuthenticated])
 def course_add_test(request, pk):
+    forbidden = _require_roles(request, ('admin', 'superadmin'))
+    if forbidden:
+        return forbidden
     """Додати тест до курсу"""
     try:
         course = Course.objects.get(id=pk)
@@ -2016,8 +2938,11 @@ def course_add_test(request, pk):
 
 
 @api_view(['DELETE'])
-@permission_classes([AllowAny])
+@permission_classes([IsAuthenticated])
 def course_remove_test(request, course_pk, test_pk):
+    forbidden = _require_roles(request, ('admin', 'superadmin'))
+    if forbidden:
+        return forbidden
     """Видалити тест з курсу"""
     try:
         test = CourseTest.objects.get(id=test_pk, course_id=course_pk)
@@ -2028,9 +2953,12 @@ def course_remove_test(request, course_pk, test_pk):
 # ===== TEAMS =====
 
 @api_view(['GET', 'POST'])
-@permission_classes([AllowAny])
+@permission_classes([IsAuthenticated])
 def teams_list(request):
+    role = _effective_role(getattr(request, 'user', None))
     if request.method == 'POST':
+        if role not in ('admin', 'superadmin'):
+            return Response({'detail': 'Forbidden'}, status=403)
         name = request.data.get('name', '')
         if not name:
             return Response({'success': False, 'error': 'Назва команди обов\'язкова'}, status=400)
@@ -2157,8 +3085,11 @@ def teams_list(request):
 
 
 @api_view(['POST'])
-@permission_classes([AllowAny])
+@permission_classes([IsAuthenticated])
 def team_add_members(request, pk):
+    forbidden = _require_roles(request, ('admin', 'superadmin'))
+    if forbidden:
+        return forbidden
     """Додати студентів до команди"""
     try:
         team = Team.objects.get(id=pk)
@@ -2201,8 +3132,11 @@ def team_add_members(request, pk):
 
 
 @api_view(['POST'])
-@permission_classes([AllowAny])
+@permission_classes([IsAuthenticated])
 def team_remove_member(request, pk):
+    forbidden = _require_roles(request, ('admin', 'superadmin'))
+    if forbidden:
+        return forbidden
     """Видалити студента з команди"""
     try:
         team = Team.objects.get(id=pk)
@@ -2223,7 +3157,11 @@ def team_remove_member(request, pk):
 
 
 @api_view(['GET', 'PUT', 'DELETE'])
+@permission_classes([IsAuthenticated])
 def team_detail(request, pk):
+    role = _effective_role(getattr(request, 'user', None))
+    if role not in ('admin', 'superadmin', 'student'):
+        return Response({'detail': 'Forbidden'}, status=403)
     try:
         team = Team.objects.get(id=pk)
     except Team.DoesNotExist:
@@ -2232,16 +3170,24 @@ def team_detail(request, pk):
         return Response(
             {'id': team.id, 'name': team.name, 'description': team.description, 'total_points': team.total_points})
     if request.method == 'PUT':
+        if role not in ('admin', 'superadmin'):
+            return Response({'detail': 'Forbidden'}, status=403)
         team.name = request.data.get('name', team.name)
         team.save()
         return Response({'success': True})
     if request.method == 'DELETE':
+        if role not in ('admin', 'superadmin'):
+            return Response({'detail': 'Forbidden'}, status=403)
         team.delete()
         return Response({'success': True})
 
 
 @api_view(['GET'])
+@permission_classes([IsAuthenticated])
 def team_members(request, pk):
+    role = _effective_role(getattr(request, 'user', None))
+    if role not in ('admin', 'superadmin', 'student'):
+        return Response({'detail': 'Forbidden'}, status=403)
     try:
         team = Team.objects.get(id=pk)
         members = TeamMember.objects.filter(team=team)
@@ -2253,9 +3199,12 @@ def team_members(request, pk):
 # ===== PUZZLES =====
 
 @api_view(['GET', 'POST'])
-@permission_classes([AllowAny])
+@permission_classes([IsAuthenticated])
 def puzzles_list(request):
+    role = _effective_role(getattr(request, 'user', None))
     if request.method == 'POST':
+        if role not in ('admin', 'superadmin'):
+            return Response({'detail': 'Forbidden'}, status=403)
         title = request.data.get('title', '')
         question = request.data.get('question', '')
         answer = request.data.get('answer', '')
@@ -2304,27 +3253,32 @@ def puzzles_list(request):
 
 
 @api_view(['GET', 'PUT', 'DELETE'])
-@permission_classes([AllowAny])
+@permission_classes([IsAuthenticated])
 def puzzle_detail(request, pk):
+    role = _effective_role(getattr(request, 'user', None))
     try:
         puzzle = Puzzle.objects.get(id=pk)
     except Puzzle.DoesNotExist:
         return Response({'success': False, 'error': 'Головоломка не знайдена'}, status=404)
 
     if request.method == 'GET':
-        return Response({
+        payload = {
             'id': puzzle.id,
             'title': puzzle.title,
             'question': puzzle.question,
-            'answer': puzzle.answer,  # Для адміна показуємо відповідь
             'hint': puzzle.hint,
             'type': puzzle.type,
             'difficulty': puzzle.difficulty,
             'points': puzzle.points,
-            'solved_by': puzzle.solved_by
-        })
+            'solved_by': puzzle.solved_by,
+        }
+        if role in ('admin', 'superadmin'):
+            payload['answer'] = puzzle.answer
+        return Response(payload)
 
     if request.method == 'PUT':
+        if role not in ('admin', 'superadmin'):
+            return Response({'detail': 'Forbidden'}, status=403)
         puzzle.title = request.data.get('title', puzzle.title)
         puzzle.question = request.data.get('question', puzzle.question)
         puzzle.answer = request.data.get('answer', puzzle.answer)
@@ -2336,14 +3290,19 @@ def puzzle_detail(request, pk):
         return Response({'success': True})
 
     if request.method == 'DELETE':
+        if role not in ('admin', 'superadmin'):
+            return Response({'detail': 'Forbidden'}, status=403)
         puzzle.delete()
         return Response({'success': True})
 
 
 @api_view(['POST'])
-@permission_classes([AllowAny])
+@permission_classes([IsAuthenticated])
 def puzzle_answer(request, pk):
     """Перевірка відповіді на загадку"""
+    role = _effective_role(getattr(request, 'user', None))
+    if role != 'student':
+        return Response({'detail': 'Forbidden'}, status=403)
     try:
         puzzle = Puzzle.objects.get(id=pk)
     except Puzzle.DoesNotExist:
@@ -2367,92 +3326,55 @@ def puzzle_answer(request, pk):
         'correct': False,
         'message': 'Неправильна відповідь. Спробуйте ще раз!'
     }, status=400)
-
-
-@api_view(['POST'])
-@permission_classes([AllowAny])
-def puzzle_answer(request, pk):
-    try:
-        puzzle = Puzzle.objects.get(id=pk)
-    except Puzzle.DoesNotExist:
-        return Response({'success': False, 'error': 'Головоломка не знайдена'}, status=404)
-
-    answer = request.data.get('answer', '').strip().lower()
-    correct_answer = puzzle.answer.strip().lower()
-
-    if answer == correct_answer:
-        puzzle.solved_by += 1
-        puzzle.save()
-        return Response({
-            'success': True,
-            'correct': True,
-            'points': puzzle.points,
-            'message': f'Правильно! Ви отримали {puzzle.points} балів!'
-        })
-
-    return Response({
-        'success': False,
-        'correct': False,
-        'message': 'Неправильна відповідь. Спробуйте ще раз!'
-    }, status=400)
-
-
-@api_view(['GET'])
-def puzzle_detail(request, pk):
-    try:
-        puzzle = Puzzle.objects.get(id=pk)
-        return Response({'id': puzzle.id, 'title': puzzle.title, 'question': puzzle.question, 'hint': puzzle.hint,
-                         'difficulty': puzzle.difficulty, 'points': puzzle.points})
-    except Puzzle.DoesNotExist:
-        return Response({'success': False, 'error': 'Головоломка не знайдена'}, status=404)
-
-
-@api_view(['POST'])
-def puzzle_answer(request, pk):
-    try:
-        puzzle = Puzzle.objects.get(id=pk)
-        answer = request.data.get('answer', '').strip().lower()
-        correct_answer = puzzle.answer.strip().lower()
-        if answer == correct_answer:
-            puzzle.solved_by += 1
-            puzzle.save()
-            return Response({'success': True, 'correct': True, 'points': puzzle.points})
-        return Response({'success': False, 'correct': False}, status=400)
-    except Puzzle.DoesNotExist:
-        return Response({'success': False, 'error': 'Головоломка не знайдена'}, status=404)
 
 
 # ===== LEARNING MATERIALS =====
 
 @api_view(['GET', 'POST'])
-@permission_classes([AllowAny])
+@permission_classes([IsAuthenticated])
 def learning_materials_list(request):
+    role = _effective_role(getattr(request, 'user', None))
     if request.method == 'POST':
+        if role not in ('admin', 'superadmin'):
+            return Response({'detail': 'Forbidden'}, status=403)
         title = request.data.get('title', '')
         if not title:
             return Response({'success': False, 'error': 'Назва обов\'язкова'}, status=400)
         material = LearningMaterial.objects.create(title=title, description=request.data.get('description', ''),
                                                    type=request.data.get('type', 'material'))
         return Response({'success': True, 'material': {'id': material.id, 'title': material.title}}, status=201)
-    materials = LearningMaterial.objects.filter(is_published=True)
+    materials = LearningMaterial.objects.all()
+    if role == 'student':
+        materials = materials.filter(is_published=True)
     return Response([{'id': m.id, 'title': m.title, 'type': m.type, 'description': m.description} for m in materials])
 
 
 @api_view(['GET', 'PUT', 'DELETE'])
+@permission_classes([IsAuthenticated])
 def learning_material_detail(request, pk):
+    role = _effective_role(getattr(request, 'user', None))
+    if role not in ('admin', 'superadmin', 'student'):
+        return Response({'detail': 'Forbidden'}, status=403)
     try:
         material = LearningMaterial.objects.get(id=pk)
     except LearningMaterial.DoesNotExist:
         return Response({'success': False, 'error': 'Матеріал не знайдений'}, status=404)
+
+    if role == 'student' and not material.is_published:
+        return Response({'detail': 'Forbidden'}, status=403)
     if request.method == 'GET':
         return Response(
             {'id': material.id, 'title': material.title, 'description': material.description, 'type': material.type})
     if request.method == 'PUT':
+        if role not in ('admin', 'superadmin'):
+            return Response({'detail': 'Forbidden'}, status=403)
         material.title = request.data.get('title', material.title)
         material.description = request.data.get('description', material.description)
         material.save()
         return Response({'success': True})
     if request.method == 'DELETE':
+        if role not in ('admin', 'superadmin'):
+            return Response({'detail': 'Forbidden'}, status=403)
         material.delete()
         return Response({'success': True})
 
@@ -2460,17 +3382,30 @@ def learning_material_detail(request, pk):
 # ===== NOTIFICATIONS =====
 
 @api_view(['GET'])
+@permission_classes([IsAuthenticated])
 def notifications_list(request):
-    notifications = Notification.objects.all()
+    notifications = Notification.objects.filter(user=request.user).order_by('-created_at')
     return Response(
-        [{'id': n.id, 'title': n.title, 'message': n.message, 'is_read': n.is_read, 'created_at': n.created_at} for n in
-         notifications])
+        [
+            {
+                'id': n.id,
+                'type': n.type,
+                'title': n.title,
+                'message': n.message,
+                'is_read': n.is_read,
+                'link': n.link,
+                'created_at': n.created_at,
+            }
+            for n in notifications
+        ]
+    )
 
 
 @api_view(['POST'])
+@permission_classes([IsAuthenticated])
 def notification_read(request, pk):
     try:
-        notification = Notification.objects.get(id=pk)
+        notification = Notification.objects.get(id=pk, user=request.user)
         notification.is_read = True
         notification.save()
         return Response({'success': True})
@@ -2481,9 +3416,16 @@ def notification_read(request, pk):
 # ===== USERS =====
 
 @api_view(['GET', 'POST'])
-@permission_classes([AllowAny])
+@permission_classes([IsAuthenticated])
 def users_list(request):
+    role = _effective_role(getattr(request, 'user', None))
+    requested_role = str(request.query_params.get('role', '') or '').strip().lower()
+
     if request.method == 'POST':
+        forbidden = _require_roles(request, ('superadmin',))
+        if forbidden:
+            return forbidden
+
         # Валідація обов'язкових полів
         required_fields = ['email', 'password', 'role']
         for field in required_fields:
@@ -2549,28 +3491,49 @@ def users_list(request):
         }, status=201)
 
     # GET - повертаємо всіх користувачів
-    users = User.objects.select_related('group').all()
+    if role in ('admin', 'superadmin'):
+        users = User.objects.select_related('group').all()
+        if role == 'admin':
+            users = users.exclude(is_superadmin=True).exclude(role='superadmin')
+        if requested_role:
+            users = users.filter(role=requested_role)
+    else:
+        # Student: allow listing admins for chat (minimal fields)
+        if requested_role and requested_role != 'admin':
+            return Response({'detail': 'Forbidden'}, status=403)
+        users = User.objects.filter(role__in=['admin', 'superadmin']).all()
+
     result = []
 
     for user in users:
-        user_data = {
-            'id': user.id,
-            'email': user.email,
-            'name': user.name,
-            'phone': user.phone or '',
-            'role': user.role,
-            'status': user.status,
-            'avatar_url': user.avatar_url or '',
-            'created_at': user.created_at.isoformat() if user.created_at else None,
-            'group': None,
-        }
-
-        if user.group:
-            user_data['group'] = {
-                'id': user.group.id,
-                'name': user.group.name,
-                'color': user.group.color,
+        if role in ('admin', 'superadmin'):
+            user_data = {
+                'id': user.id,
+                'email': user.email,
+                'name': user.name,
+                'phone': user.phone or '',
+                'role': _effective_role(user) or user.role,
+                'status': getattr(user, 'status', ''),
+                'avatar_url': user.avatar_url or '',
+                'created_at': user.created_at.isoformat() if user.created_at else None,
+                'group': None,
             }
+        else:
+            user_data = {
+                'id': user.id,
+                'email': user.email,
+                'name': user.name,
+                'role': _effective_role(user) or user.role,
+                'avatar_url': user.avatar_url or '',
+            }
+
+        if role in ('admin', 'superadmin'):
+            if user.group:
+                user_data['group'] = {
+                    'id': user.group.id,
+                    'name': user.group.name,
+                    'color': user.group.color,
+                }
 
         result.append(user_data)
 
@@ -2578,12 +3541,19 @@ def users_list(request):
 
 
 @api_view(['GET', 'PUT', 'DELETE'])
-@permission_classes([AllowAny])
+@permission_classes([IsAuthenticated])
 def user_detail(request, pk):
     try:
         user = User.objects.select_related('group').get(id=pk)
     except User.DoesNotExist:
         return Response({'success': False, 'error': 'Користувача не знайдено'}, status=404)
+
+    viewer = request.user
+    viewer_role = _effective_role(viewer)
+    if viewer_role == 'admin' and (getattr(user, 'is_superadmin', False) or getattr(user, 'role', None) == 'superadmin'):
+        return Response({'detail': 'Forbidden'}, status=403)
+    if viewer_role == 'student' and user.id != viewer.id:
+        return Response({'detail': 'Forbidden'}, status=403)
 
     if request.method == 'GET':
         return Response({
@@ -2602,6 +3572,8 @@ def user_detail(request, pk):
         })
 
     if request.method == 'PUT':
+        if viewer_role != 'superadmin':
+            return Response({'detail': 'Forbidden'}, status=403)
         user.email = request.data.get('email', user.email)
 
         # Оновлюємо ім'я (може бути повне ПІБ)
@@ -2629,5 +3601,7 @@ def user_detail(request, pk):
         return Response({'success': True})
 
     if request.method == 'DELETE':
+        if viewer_role != 'superadmin':
+            return Response({'detail': 'Forbidden'}, status=403)
         user.delete()
         return Response({'success': True})

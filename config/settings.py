@@ -69,6 +69,15 @@ WSGI_APPLICATION = 'config.wsgi.application'
 DB_ENGINE = os.getenv('DB_ENGINE', 'sqlite').lower()
 
 if DB_ENGINE in ('mssql', 'sqlserver', 'azure'):
+    DB_AUTH = os.getenv('DB_AUTH', 'sql').lower()
+    extra_params = os.getenv(
+        'DB_EXTRA_PARAMS',
+        'Encrypt=yes;TrustServerCertificate=no;Connection Timeout=30;'
+    )
+
+    if DB_AUTH in ('aad', 'activedirectory', 'azuread', 'entra'):
+        extra_params = f'Authentication=ActiveDirectoryPassword;{extra_params}'
+
     DATABASES = {
         'default': {
             'ENGINE': 'mssql',
@@ -79,10 +88,7 @@ if DB_ENGINE in ('mssql', 'sqlserver', 'azure'):
             'PORT': os.getenv('DB_PORT', '1433'),
             'OPTIONS': {
                 'driver': os.getenv('DB_DRIVER', 'ODBC Driver 18 for SQL Server'),
-                'extra_params': os.getenv(
-                    'DB_EXTRA_PARAMS',
-                    'Encrypt=yes;TrustServerCertificate=no;Connection Timeout=30;'
-                ),
+                'extra_params': extra_params,
             },
         }
     }

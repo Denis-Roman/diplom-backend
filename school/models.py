@@ -13,6 +13,10 @@ class User(models.Model):
     role = models.CharField(max_length=20, choices=ROLE_CHOICES, default='student')
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='active')
     phone = models.CharField(max_length=50, blank=True, null=True)
+    first_name = models.CharField(max_length=150, blank=True, null=True, db_column='firstName')
+    last_name = models.CharField(max_length=150, blank=True, null=True, db_column='lastName')
+    birth_date = models.DateField(blank=True, null=True, db_column='birthDate')
+    registration_address = models.TextField(blank=True, null=True, db_column='registrationAddress')
     avatar_url = models.TextField(blank=True, null=True, db_column='avatarUrl')
     created_at = models.DateTimeField(auto_now_add=True, db_column='createdAt')
     updated_at = models.DateTimeField(auto_now=True, db_column='updatedAt')
@@ -26,6 +30,14 @@ class User(models.Model):
 
     def __str__(self):
         return self.name
+
+    @property
+    def is_authenticated(self):
+        return True
+
+    @property
+    def is_anonymous(self):
+        return False
 
 
 class Group(models.Model):
