@@ -1,10 +1,13 @@
 import os
 from pathlib import Path
+
 from dotenv import load_dotenv
 
-load_dotenv()
-
 BASE_DIR = Path(__file__).resolve().parent.parent
+
+# Local overrides should win (e.g. SQLite for dev), while keeping `.env` usable for Azure.
+load_dotenv(BASE_DIR / ".env.local", override=True)
+load_dotenv(BASE_DIR / ".env", override=False)
 
 SECRET_KEY = os.getenv('DJANGO_SECRET_KEY', 'django-insecure-change-me-in-production-!!!')
 JWT_SECRET = os.getenv('JWT_SECRET', 'your-secret-key-min-32-characters!')

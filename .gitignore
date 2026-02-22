@@ -18,6 +18,8 @@ media/
 # Env files
 .env
 .env.*
+!.env.example
+!.env.local.example
 
 # IDE
 .idea/
