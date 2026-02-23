@@ -16,6 +16,7 @@ from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from django.db import models
 from django.db.models import Sum
+from django.db.models.functions import Coalesce
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated
@@ -601,27 +602,53 @@ def administrators_list(request):
 @api_view(['POST'])
 @permission_classes([AllowAny])
 def auth_register(request):
-    email = request.data.get('email', '')
-    password = request.data.get('password', '')
-    name = request.data.get('name', '')
+    email = (request.data.get('email', '') or '').strip().lower()
+    password = request.data.get('password', '') or ''
+    name = (request.data.get('name', '') or '').strip()
+
     if not email or not password:
         return Response({'success': False, 'error': "Email та пароль обов'язкові"}, status=400)
     if len(password) < 6:
         return Response({'success': False, 'error': 'Пароль має бути не менше 6 символів'}, status=400)
     if User.objects.filter(email=email).exists():
         return Response({'success': False, 'error': 'Користувач з таким email вже існує'}, status=400)
-    hashed_password = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+
+    # Use Django password hashing to stay compatible with check_password in auth_login.
     user = User.objects.create(
         email=email,
-        password=hashed_password,
+        password=make_password(password),
         name=name or email.split('@')[0],
         role='student',
         status='active',
-        is_active = True,
+        is_active=True,
+        is_superadmin=False,
     )
+
+    token = jwt.encode(
+        {
+            'userId': user.id,
+            'exp': timezone.now() + timedelta(days=7),
+        },
+        settings.JWT_SECRET,
+        algorithm='HS256',
+    )
+
     return Response(
-        {'success': True, 'user': {'id': user.id, 'email': user.email, 'name': user.name, 'role': user.role}},
-        status=201)
+        {
+            'success': True,
+            'token': token,
+            'user': {
+                'id': user.id,
+                'email': user.email,
+                'name': user.name,
+                'role': user.role,
+                'is_active': user.is_active,
+                'is_superadmin': user.is_superadmin,
+                'group_id': user.group_id,
+            },
+        },
+        status=201,
+    )
 
 
 @api_view(['POST'])
@@ -1203,6 +1230,7 @@ def student_detail(request, pk):
     if request.method == 'PUT':
         student.name = request.data.get('name', student.name)
         student.email = request.data.get('email', student.email)
+        group_id = request.data.get('group_id', None)
         is_active = request.data.get('is_active', None)
         if is_active is not None:
             # Безпечне приведення типу!
@@ -1215,6 +1243,30 @@ def student_detail(request, pk):
             else:
                 student.is_active = bool(is_active)
         student.save()
+
+        # Optional group update (keeps legacy GroupStudent table in sync)
+        if group_id is not None:
+            group = None
+            if str(group_id).strip() not in ('', 'null', 'None'):
+                try:
+                    group = Group.objects.get(id=group_id)
+                except Group.DoesNotExist:
+                    return Response({'success': False, 'error': 'Група не знайдена.'}, status=404)
+
+            if group is None:
+                GroupStudent.objects.filter(student=student).delete()
+                if getattr(student, 'group_id', None) is not None:
+                    student.group = None
+                    student.save(update_fields=['group'])
+            else:
+                # ensure membership exists
+                GroupStudent.objects.get_or_create(group=group, student=student)
+                # optional: clear other memberships to avoid ambiguity
+                GroupStudent.objects.filter(student=student).exclude(group=group).delete()
+                if getattr(student, 'group_id', None) != group.id:
+                    student.group = group
+                    student.save(update_fields=['group'])
+
         return Response({'success': True, 'student': {
             'id': student.id,
             'name': student.name,
@@ -2081,7 +2133,12 @@ def task_submissions(request, pk):
 
         return Response({'success': True, 'submission': {'id': submission.id, 'status': submission.status, 'files': saved_files}}, status=201)
 
-    submissions_qs = TaskSubmission.objects.select_related('student').filter(task=task)
+    submissions_qs = (
+        TaskSubmission.objects
+        .select_related('student')
+        .prefetch_related('files')
+        .filter(task=task)
+    )
     if role == 'student':
         submissions_qs = submissions_qs.filter(student=request.user)
         return Response([
@@ -2103,7 +2160,29 @@ def task_submissions(request, pk):
     if role not in ('admin', 'superadmin'):
         return Response({'detail': 'Forbidden'}, status=403)
     return Response(
-        [{'id': s.id, 'student': s.student.name, 'status': s.status, 'grade': s.grade} for s in submissions_qs]
+        [
+            {
+                'id': s.id,
+                'student': s.student.name,
+                'student_id': s.student_id,
+                'status': s.status,
+                'grade': s.grade,
+                'comment': s.comment,
+                'teacher_comment': getattr(s, 'teacher_comment', None) or None,
+                'submitted_at': s.submitted_at.isoformat() if getattr(s, 'submitted_at', None) else None,
+                'files': [
+                    {
+                        'id': f.id,
+                        'name': f.file_name,
+                        'url': f.file_url,
+                        'size': f.file_size,
+                        'type': f.file_type,
+                    }
+                    for f in s.files.all()
+                ],
+            }
+            for s in submissions_qs
+        ]
     )
 
 
@@ -2118,6 +2197,59 @@ def grade_submission(request, pk):
         submission = TaskSubmission.objects.select_related('task', 'student').get(id=pk)
     except TaskSubmission.DoesNotExist:
         return Response({'success': False, 'error': 'Здачу не знайдено'}, status=404)
+
+    requested_status = request.data.get('status', None)
+    requested_action = request.data.get('action', None)
+    if isinstance(requested_status, str):
+        requested_status = requested_status.strip().lower()
+    if isinstance(requested_action, str):
+        requested_action = requested_action.strip().lower()
+
+    # Support "return/reject" flow (no grade required)
+    if requested_status == 'returned' or requested_action in ('return', 'reject', 'returned'):
+        teacher_comment = request.data.get('teacher_comment', None)
+        if teacher_comment is None:
+            teacher_comment = request.data.get('comment', None)
+
+        submission.grade = None
+        submission.teacher_comment = (str(teacher_comment).strip() if teacher_comment is not None else None) or None
+        submission.status = 'returned'
+        submission.graded_at = timezone.now()
+        submission.save(update_fields=['grade', 'teacher_comment', 'status', 'graded_at'])
+
+        # If the submission is returned, remove previously awarded points for this task.
+        try:
+            StudentPoint.objects.filter(
+                student=submission.student,
+                source_type='task',
+                source_id=submission.task_id,
+            ).delete()
+        except Exception:
+            pass
+
+        try:
+            Notification.objects.create(
+                user=submission.student,
+                type='task',
+                title='Повернено на доопрацювання',
+                message=(f"{submission.task.title}: повернено" + (f". {submission.teacher_comment}" if submission.teacher_comment else '')),
+                link='/dashboard/learning',
+            )
+        except Exception:
+            pass
+
+        return Response({
+            'success': True,
+            'submission': {
+                'id': submission.id,
+                'task_id': submission.task_id,
+                'student_id': submission.student_id,
+                'status': submission.status,
+                'grade': submission.grade,
+                'teacher_comment': submission.teacher_comment,
+                'graded_at': submission.graded_at.isoformat() if submission.graded_at else None,
+            }
+        })
 
     raw_grade = request.data.get('grade', None)
     if raw_grade is None:
@@ -2144,6 +2276,31 @@ def grade_submission(request, pk):
     submission.status = 'graded'
     submission.graded_at = timezone.now()
     submission.save(update_fields=['grade', 'teacher_comment', 'status', 'graded_at'])
+
+    # Award/update points for the task grade so leaderboard & balance reflect homework results.
+    try:
+        desc = f"Оцінка за завдання: {submission.task.title}" if getattr(submission, 'task', None) else "Оцінка за завдання"
+        existing = (
+            StudentPoint.objects
+            .filter(student=submission.student, source_type='task', source_id=submission.task_id)
+            .order_by('id')
+        )
+        first = existing.first()
+        if first:
+            existing.exclude(id=first.id).delete()
+            first.points = int(grade_value)
+            first.description = desc
+            first.save(update_fields=['points', 'description'])
+        else:
+            StudentPoint.objects.create(
+                student=submission.student,
+                points=int(grade_value),
+                source_type='task',
+                source_id=submission.task_id,
+                description=desc,
+            )
+    except Exception:
+        pass
 
     try:
         Notification.objects.create(
@@ -2578,24 +2735,30 @@ def admin_stats(request):
 
 
 @api_view(['GET'])
+@permission_classes([IsAuthenticated])
 def leaderboard(request):
     forbidden = _require_roles(request, ('admin', 'superadmin', 'student'))
     if forbidden:
         return forbidden
-    points = (
-        StudentPoint.objects.values('student_id', 'student__name', 'student__avatar_url')
-        .annotate(total=Sum('points'))
-        .order_by('-total')[:10]
+
+    # Include students with 0 points so the leaderboard isn't empty on fresh DBs.
+    students = (
+        User.objects
+        .filter(role='student')
+        .annotate(total=Coalesce(Sum('points__points'), 0))
+        .order_by('-total', 'id')[:10]
     )
+
     payload = []
-    for idx, row in enumerate(points, start=1):
+    for idx, student in enumerate(students, start=1):
         payload.append({
-            'id': row.get('student_id'),
-            'name': row.get('student__name') or f"Учень {idx}",
-            'avatar': row.get('student__avatar_url') or '',
-            'points': row.get('total') or 0,
+            'id': student.id,
+            'name': getattr(student, 'name', None) or f"Учень {idx}",
+            'avatar': getattr(student, 'avatar_url', None) or '',
+            'points': int(getattr(student, 'total', 0) or 0),
             'rank': idx,
         })
+
     return Response(payload)
 
 
