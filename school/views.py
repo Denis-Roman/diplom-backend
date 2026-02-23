@@ -2217,8 +2217,11 @@ def attendance_list(request):
             }
         }, status=201)
 
-    # GET - повертаємо всі записи
+    # GET - повертаємо записи (опційно фільтруємо)
     attendance_records = Attendance.objects.select_related('lesson', 'user', 'lesson__group', 'lesson__subject').all()
+    lesson_id = request.query_params.get('lesson_id')
+    if lesson_id is not None and str(lesson_id).strip():
+        attendance_records = attendance_records.filter(lesson_id=lesson_id)
     if role == 'student':
         attendance_records = attendance_records.filter(user=request.user)
     elif role not in ('admin', 'superadmin'):
