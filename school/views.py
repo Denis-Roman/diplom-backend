@@ -2973,13 +2973,23 @@ def chat_messages(request, pk):
 
     if request.method == 'POST':
         content = str(request.data.get('content', '') or '')
-        message = ChatMessage.objects.create(chat=chat, sender=request.user, content=content)
 
         files = []
         try:
             files = request.FILES.getlist('files')
         except Exception:
             files = []
+
+        if not content.strip() and len(files) == 0:
+            return Response({'success': False, 'error': 'Повідомлення порожнє'}, status=400)
+
+        # Ensure sender is a participant (helps keep chats consistent for admins too).
+        try:
+            ChatParticipant.objects.get_or_create(chat=chat, user=request.user)
+        except Exception:
+            pass
+
+        message = ChatMessage.objects.create(chat=chat, sender=request.user, content=content)
 
         for f in files:
             safe_name = get_valid_filename(getattr(f, 'name', 'file'))
@@ -2999,6 +3009,28 @@ def chat_messages(request, pk):
                 url=url,
                 size=str(getattr(f, 'size', '') or ''),
             )
+
+        # Notify other participants about a new message.
+        try:
+            other_users = (
+                User.objects.filter(chat_participations__chat=chat)
+                .exclude(id=request.user.id)
+                .distinct()
+            )
+            link = f"/dashboard/chat?chatId={chat.id}"
+            preview = content.strip() or 'Вкладення'
+            if len(preview) > 200:
+                preview = preview[:200] + '…'
+            for u in other_users:
+                Notification.objects.create(
+                    user=u,
+                    type='message',
+                    title='Нове повідомлення',
+                    message=preview,
+                    link=link,
+                )
+        except Exception:
+            pass
 
         return Response({'success': True, 'message': {'id': message.id}}, status=201)
 
@@ -3026,7 +3058,7 @@ def chat_messages(request, pk):
                 'sender_id': m.sender_id,
                 'sender': m.sender.name,
                 'content': m.content,
-                'created_at': m.created_at,
+                'created_at': m.created_at.isoformat() if m.created_at else '',
                 'attachments': attachments,
             }
         )
