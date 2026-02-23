@@ -2047,7 +2047,8 @@ def task_submissions(request, pk):
                 'status': s.status,
                 'grade': s.grade,
                 'comment': s.comment,
-                'submitted_at': s.submitted_at,
+                'teacher_comment': getattr(s, 'teacher_comment', None) or None,
+                'submitted_at': s.submitted_at.isoformat() if getattr(s, 'submitted_at', None) else None,
                 'files': [
                     {'id': f.id, 'name': f.file_name, 'url': f.file_url, 'size': f.file_size, 'type': f.file_type}
                     for f in s.files.all()
