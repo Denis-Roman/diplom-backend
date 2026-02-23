@@ -841,6 +841,8 @@ def students_list(request):
         name = request.data.get('name', '').strip()
         email = request.data.get('email', '').strip().lower()
         password = request.data.get('password', '')
+        phone = (request.data.get('phone') or '').strip()
+        group_id = request.data.get('group_id', None)
 
         if not (name and email and password):
             return Response({'error': 'Всі поля обовʼязкові!'}, status=400)
@@ -848,14 +850,28 @@ def students_list(request):
             return Response({'error': 'Пароль має бути не менше 6 символів!'}, status=400)
         if User.objects.filter(email=email).exists():
             return Response({'error': 'Email вже існує.'}, status=400)
+
+        group = None
+        if group_id:
+            try:
+                group = Group.objects.get(id=group_id)
+            except Group.DoesNotExist:
+                return Response({'error': 'Група не знайдена.'}, status=404)
+
         user = User.objects.create(
             name=name,
             email=email,
             password=make_password(password),
             is_active=True,
             is_superadmin=False,
-            role='student'
+            role='student',
+            phone=phone or None,
+            group=group,
         )
+
+        if group:
+            GroupStudent.objects.get_or_create(group=group, student=user)
+
         return Response({
             "id": user.id,
             "name": user.name,
@@ -947,6 +963,10 @@ def group_add_students(request, pk):
             student = User.objects.get(id=student_id, role='student')
             if not GroupStudent.objects.filter(group=group, student=student).exists():
                 GroupStudent.objects.create(group=group, student=student)
+                # Keep denormalized FK in sync for filters (tasks/schedule/grades).
+                if getattr(student, 'group_id', None) != group.id:
+                    student.group = group
+                    student.save(update_fields=['group'])
                 added_count += 1
         except User.DoesNotExist:
             continue
@@ -977,6 +997,9 @@ def group_remove_student(request, pk):
     try:
         student = User.objects.get(id=student_id, role='student')
         GroupStudent.objects.filter(group=group, student=student).delete()
+        if getattr(student, 'group_id', None) == group.id:
+            student.group = None
+            student.save(update_fields=['group'])
         return Response({'success': True, 'message': 'Студента видалено з групи'})
     except User.DoesNotExist:
         return Response({'success': False, 'error': 'Студент не знайдений'}, status=404)
