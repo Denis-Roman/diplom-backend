@@ -2536,7 +2536,7 @@ def leaderboard(request):
     if forbidden:
         return forbidden
     points = (
-        StudentPoint.objects.values('student_id', 'student__name')
+        StudentPoint.objects.values('student_id', 'student__name', 'student__avatar_url')
         .annotate(total=Sum('points'))
         .order_by('-total')[:10]
     )
@@ -2545,6 +2545,7 @@ def leaderboard(request):
         payload.append({
             'id': row.get('student_id'),
             'name': row.get('student__name') or f"Учень {idx}",
+            'avatar': row.get('student__avatar_url') or '',
             'points': row.get('total') or 0,
             'rank': idx,
         })
