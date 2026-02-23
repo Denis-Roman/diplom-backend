@@ -1,5 +1,6 @@
 import os
 import json
+import datetime
 import bcrypt
 import jwt
 from datetime import timedelta
@@ -203,56 +204,90 @@ def news_create(request):
     return Response({'success': True, 'news_id': news.id}, status=201)
 
 
-@api_view(['POST'])
-@permission_classes([IsAuthenticated])  # для продакшн, для тест��в можеш вмикати AllowAny
 def create_invoice(request):
+    """Internal helper used by POST /api/invoices/.
+
+    IMPORTANT: must accept DRF Request (not wrapped by @api_view), otherwise calling it
+    from another DRF view will raise AssertionError.
+    """
+
     forbidden = _require_roles(request, ('admin', 'superadmin'))
     if forbidden:
         return forbidden
+
     students = request.data.get('student_ids', [])
-    amount = request.data.get('amount')
-    description = request.data.get('description', '')
-    installments = int(request.data.get('installments', 1))
-    due_date = request.data.get('due_date')
-    if not students or not amount or not due_date:
-        return Response({'success': False, 'error': 'Всі поля обов’язкові'}, status=400)
+    amount_raw = request.data.get('amount')
+    description = (request.data.get('description', '') or '').strip()
+    installments_raw = request.data.get('installments', 1)
+    due_date_raw = request.data.get('due_date')
+
+    if not isinstance(students, list) or not students:
+        return Response({'success': False, 'error': 'Оберіть хоча б одного учня'}, status=400)
+
+    try:
+        amount = float(amount_raw)
+    except (TypeError, ValueError):
+        return Response({'success': False, 'error': 'Некоректна сума'}, status=400)
+    if amount <= 0:
+        return Response({'success': False, 'error': 'Сума має бути більшою за 0'}, status=400)
+
+    try:
+        installments = int(installments_raw)
+    except (TypeError, ValueError):
+        installments = 1
+    if installments < 1:
+        installments = 1
+
+    due_date = parse_date(str(due_date_raw or '').strip())
+    if not due_date:
+        return Response({'success': False, 'error': 'Некоректна дата платежу'}, status=400)
 
     # Перевірка дати платежу проти дати реєстрації
-    for sid in students:
-        student = User.objects.get(id=sid)
-        reg_date = student.registered_at
-        d = datetime.datetime.strptime(due_date, '%Y-%m-%d').date()
-        if d < reg_date:
-            return Response({
-                'success': False,
-                'error': f'Дата платежу для {student.name} раніше дати реєстрації: {reg_date}'
-            }, status=400)
+    students_qs = User.objects.filter(id__in=students)
+    found_ids = set(students_qs.values_list('id', flat=True))
+    missing = [sid for sid in students if sid not in found_ids]
+    if missing:
+        return Response({'success': False, 'error': f'Учні не знайдені: {missing}'}, status=404)
+
+    for student in students_qs:
+        reg_date = getattr(student, 'registered_at', None)
+        if isinstance(reg_date, datetime.datetime):
+            reg_date = reg_date.date()
+        if reg_date and due_date < reg_date:
+            return Response(
+                {
+                    'success': False,
+                    'error': (
+                        f'Дата платежу для {student.name} раніше дати реєстрації: '
+                        f'{reg_date.isoformat()}'
+                    ),
+                },
+                status=400,
+            )
 
     # Створення рахунка для кожного студента
     result = []
-    for sid in students:
-        student = User.objects.get(id=sid)
-        first_due = datetime.datetime.strptime(due_date, '%Y-%m-%d').date()
+    for student in students_qs:
         for i in range(installments):
-            current_due = first_due + datetime.timedelta(days=30 * i)
+            current_due = due_date + datetime.timedelta(days=30 * i)
             inv = Invoice.objects.create(
                 student=student,
                 amount=amount,
                 paid_amount=0,
                 installments=installments,
-                current_installment=i+1,
+                current_installment=i + 1,
                 description=description,
                 status='pending',
                 due_date=current_due,
             )
-            # Створити Notification (TODO: e-mail/ інша розсилка)
             Notification.objects.create(
                 user=student,
                 type='invoice',
                 title='Новий рахунок',
-                message=f'��ам виставлено рахунок на {amount} грн.',
+                message=f'Вам виставлено рахунок на {amount} грн.',
             )
-            result.append({'invoice_id': inv.id, 'installment': i+1})
+            result.append({'invoice_id': inv.id, 'installment': i + 1})
+
     return Response({'success': True, 'created': result}, status=201)
 
 @api_view(['GET'])
