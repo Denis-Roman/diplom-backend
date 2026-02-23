@@ -73,6 +73,10 @@ urlpatterns = [
     # Leaderboard
     path('leaderboard/', views.leaderboard, name='leaderboard'),
 
+    # Achievements / Points
+    path('achievements/me/', views.achievements_me, name='achievements-me'),
+    path('points/me/', views.points_me, name='points-me'),
+
     # News
     path('news/', views.news_list, name='news-list'),
     path('news/<int:pk>/', views.news_detail, name='news-detail'),

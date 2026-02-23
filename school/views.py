@@ -2430,6 +2430,114 @@ def leaderboard(request):
     return Response(payload)
 
 
+# ===== ACHIEVEMENTS / POINTS =====
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def points_me(request):
+    role = _effective_role(getattr(request, 'user', None))
+    if role != 'student':
+        return Response({'detail': 'Forbidden'}, status=403)
+
+    total = (
+        StudentPoint.objects
+        .filter(student=request.user)
+        .aggregate(total=Sum('points'))
+        .get('total')
+        or 0
+    )
+    return Response({'totalPoints': int(total)})
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def achievements_me(request):
+    role = _effective_role(getattr(request, 'user', None))
+    if role != 'student':
+        return Response({'detail': 'Forbidden'}, status=403)
+
+    student = request.user
+
+    submissions = (
+        TaskSubmission.objects
+        .select_related('task')
+        .filter(student=student)
+    )
+    submissions_count = submissions.count()
+
+    present_count = Attendance.objects.filter(user=student, status='present').count()
+
+    excellent_count = LessonGrade.objects.filter(student=student, grade__gte=10).count()
+
+    speedrunner = 0
+    timely = 0
+    for s in submissions:
+        task = getattr(s, 'task', None)
+        due = getattr(task, 'due_date', None) if task else None
+        submitted_at = getattr(s, 'submitted_at', None)
+        if not (due and submitted_at):
+            continue
+        try:
+            if submitted_at <= due:
+                timely += 1
+            if submitted_at <= (due - datetime.timedelta(days=1)):
+                speedrunner += 1
+        except Exception:
+            pass
+
+    in_team = TeamMember.objects.filter(student=student).exists()
+
+    # марафон: підрахунок поточної серії днів активності (attendance present або submission)
+    activity_days = set()
+    for a in Attendance.objects.select_related('lesson').filter(user=student, status='present'):
+        try:
+            if a.lesson and a.lesson.date:
+                activity_days.add(a.lesson.date)
+        except Exception:
+            pass
+    for s in submissions:
+        try:
+            if s.submitted_at:
+                activity_days.add(timezone.localtime(s.submitted_at).date())
+        except Exception:
+            pass
+
+    streak = 0
+    if activity_days:
+        day = timezone.localdate()
+        while day in activity_days and streak < 30:
+            streak += 1
+            day = day - datetime.timedelta(days=1)
+
+    def _ach(aid: int, title: str, description: str, progress: int, max_progress: int, points: int):
+        progress = int(progress or 0)
+        max_progress = int(max_progress or 1)
+        unlocked = progress >= max_progress
+        if progress > max_progress:
+            progress = max_progress
+        return {
+            'id': aid,
+            'title': title,
+            'description': description,
+            'progress': progress,
+            'maxProgress': max_progress,
+            'points': int(points),
+            'isUnlocked': bool(unlocked),
+        }
+
+    payload = [
+        _ach(1, 'Перші кроки', 'Завершіть перше завдання', 1 if submissions_count > 0 else 0, 1, 20),
+        _ach(2, 'Активний учень', 'Відвідайте 5 занять', present_count, 5, 30),
+        _ach(3, 'Відмінник', "Отримайте 5 оцінок 'Відмінно'", excellent_count, 5, 40),
+        _ach(4, 'Спідранер', 'Здайте завдання за день до дедлайну', speedrunner, 3, 25),
+        _ach(5, "Книжковий черв'як", 'Перегляньте всі матеріали курсу', 0, 10, 35),
+        _ach(6, 'Точність', 'Здайте 10 завдань вчасно', timely, 10, 50),
+        _ach(7, 'Командний гравець', 'Візьміть участь у груповому проекті', 1 if in_team else 0, 1, 20),
+        _ach(8, 'Марафонець', 'Навчайтесь 30 днів поспіль', streak, 30, 60),
+    ]
+    return Response(payload)
+
+
 # ===== NEWS =====
 
 
