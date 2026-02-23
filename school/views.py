@@ -3334,6 +3334,19 @@ def poll_close(request, pk):
 @permission_classes([IsAuthenticated])
 def courses_list(request):
     role = _effective_role(getattr(request, 'user', None))
+
+    def _parse_bool(value, default=False):
+        if value is None:
+            return default
+        if isinstance(value, bool):
+            return value
+        s = str(value).strip().lower()
+        if s in ('1', 'true', 'yes', 'y', 'on'):
+            return True
+        if s in ('0', 'false', 'no', 'n', 'off', ''):
+            return False
+        return default
+
     if request.method == 'POST':
         if role not in ('admin', 'superadmin'):
             return Response({'detail': 'Forbidden'}, status=403)
@@ -3364,7 +3377,7 @@ def courses_list(request):
             group=group,
             subject=subject,
             thumbnail=request.data.get('thumbnail', ''),
-            is_published=request.data.get('is_published', False)
+            is_published=_parse_bool(request.data.get('is_published', False), default=False)
         )
 
         return Response({
@@ -3381,8 +3394,15 @@ def courses_list(request):
     courses = Course.objects.select_related('group', 'subject').all()
     if role == 'student':
         courses = courses.filter(is_published=True)
-        if getattr(request.user, 'group_id', None):
-            courses = courses.filter(models.Q(group__isnull=True) | models.Q(group_id=request.user.group_id))
+        effective_group_id = getattr(request.user, 'group_id', None)
+        if not effective_group_id:
+            effective_group_id = (
+                GroupStudent.objects.filter(student_id=request.user.id)
+                .values_list('group_id', flat=True)
+                .first()
+            )
+        if effective_group_id:
+            courses = courses.filter(models.Q(group__isnull=True) | models.Q(group_id=effective_group_id))
         else:
             courses = courses.filter(group__isnull=True)
     result = []
@@ -3394,7 +3414,7 @@ def courses_list(request):
             'description': course.description,
             'thumbnail': course.thumbnail,
             'is_published': course.is_published,
-            'created_at': course.created_at,
+            'created_at': course.created_at.isoformat() if getattr(course, 'created_at', None) else '',
             'group': None,
             'subject': None,
             'materials_count': course.materials.count() if hasattr(course, 'materials') else 0,
@@ -3433,7 +3453,14 @@ def course_detail(request, pk):
     if role == 'student':
         if not course.is_published:
             return Response({'detail': 'Forbidden'}, status=403)
-        if course.group_id and getattr(request.user, 'group_id', None) != course.group_id:
+        effective_group_id = getattr(request.user, 'group_id', None)
+        if not effective_group_id:
+            effective_group_id = (
+                GroupStudent.objects.filter(student_id=request.user.id)
+                .values_list('group_id', flat=True)
+                .first()
+            )
+        if course.group_id and effective_group_id != course.group_id:
             return Response({'detail': 'Forbidden'}, status=403)
 
     if request.method == 'GET':
@@ -3458,7 +3485,7 @@ def course_detail(request, pk):
                 options_data = [{
                     'id': o.id,
                     'text': o.text,
-                    'is_correct': o.is_correct,
+                    'is_correct': o.is_correct if role in ('admin', 'superadmin') else None,
                     'order': o.order
                 } for o in q.options.all()]
 
@@ -3487,6 +3514,7 @@ def course_detail(request, pk):
             'description': course.description,
             'thumbnail': course.thumbnail,
             'is_published': course.is_published,
+            'created_at': course.created_at.isoformat() if getattr(course, 'created_at', None) else '',
             'group': {
                 'id': course.group.id,
                 'name': course.group.name,
@@ -3505,10 +3533,23 @@ def course_detail(request, pk):
     if request.method == 'PUT':
         if role not in ('admin', 'superadmin'):
             return Response({'detail': 'Forbidden'}, status=403)
+
+        def _parse_bool(value, default=False):
+            if value is None:
+                return default
+            if isinstance(value, bool):
+                return value
+            s = str(value).strip().lower()
+            if s in ('1', 'true', 'yes', 'y', 'on'):
+                return True
+            if s in ('0', 'false', 'no', 'n', 'off', ''):
+                return False
+            return default
+
         course.title = request.data.get('title', course.title)
         course.description = request.data.get('description', course.description)
         course.thumbnail = request.data.get('thumbnail', course.thumbnail)
-        course.is_published = request.data.get('is_published', course.is_published)
+        course.is_published = _parse_bool(request.data.get('is_published', course.is_published), default=bool(course.is_published))
 
         group_id = request.data.get('group_id')
         if group_id:
@@ -3565,7 +3606,11 @@ def course_add_material(request, pk):
         url=url,
         order=max_order + 1,
         duration=request.data.get('duration'),
-        is_required=request.data.get('is_required', True)
+        is_required=(
+            (str(request.data.get('is_required')).strip().lower() not in ('0', 'false', 'no', 'off'))
+            if request.data.get('is_required') is not None
+            else True
+        )
     )
 
     return Response({
