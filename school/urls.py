@@ -62,6 +62,9 @@ urlpatterns = [
     path('invoices/', views.invoices_list, name='invoices-list'),
     path('invoices/history/', views.invoices_history, name='invoices-history'),
     path('invoices/<int:pk>/remind/', views.invoice_remind, name='invoice-remind'),
+    path('invoices/<int:pk>/pay/', views.invoice_pay, name='invoice-pay'),
+    path('invoices/<int:pk>/submit-receipt/', views.invoice_submit_receipt, name='invoice-submit-receipt'),
+    path('invoices/<int:pk>/receipts/<int:receipt_id>/review/', views.invoice_receipt_review, name='invoice-receipt-review'),
 
     # Admin
     path('admin/stats/', views.admin_stats, name='admin-stats'),

@@ -227,6 +227,35 @@ class Invoice(models.Model):
         db_table = 'Invoices'
 
 
+class InvoicePaymentReceipt(models.Model):
+    STATUS_CHOICES = [
+        ('pending', 'Pending'),
+        ('approved', 'Approved'),
+        ('rejected', 'Rejected'),
+    ]
+
+    invoice = models.ForeignKey(Invoice, on_delete=models.CASCADE, db_column='invoiceId', related_name='receipts')
+    student = models.ForeignKey(User, on_delete=models.CASCADE, db_column='studentId', related_name='invoice_receipts')
+    reviewed_by = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        db_column='reviewedBy',
+        related_name='reviewed_invoice_receipts',
+    )
+    amount = models.DecimalField(max_digits=10, decimal_places=2)
+    receipt_url = models.TextField(db_column='receiptUrl')
+    receipt_name = models.CharField(max_length=255, db_column='receiptName')
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='pending')
+    note = models.TextField(blank=True, null=True)
+    reviewed_at = models.DateTimeField(null=True, blank=True, db_column='reviewedAt')
+    created_at = models.DateTimeField(auto_now_add=True, db_column='createdAt')
+
+    class Meta:
+        db_table = 'InvoicePaymentReceipts'
+
+
 class Notification(models.Model):
     user = models.ForeignKey(User, on_delete=models.CASCADE, db_column='userId', related_name='notifications')
     type = models.CharField(max_length=50)

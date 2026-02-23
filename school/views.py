@@ -32,7 +32,7 @@ from school.models import (
     Attendance, Invoice, Notification, News, ExtraNews, StudentPoint,
     Team, TeamMember, Chat, ChatParticipant, ChatMessage, ChatMessageAttachment, Poll,
     PollOption, CourseMaterial, CourseTest, TestQuestion, QuestionOption, PollVote, Course, Puzzle, LearningMaterial,
-    TaskSubmission, SubmissionFile,
+    TaskSubmission, SubmissionFile, InvoicePaymentReceipt,
 )
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import AllowAny
@@ -354,6 +354,173 @@ def invoice_remind(request, pk):
         {'success': True, 'message': f'Нагадування надіслано: {student.email}'},
         status=200,
     )
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def invoice_pay(request, pk):
+    from decimal import Decimal, InvalidOperation
+
+    role = _effective_role(getattr(request, 'user', None))
+    invoice = Invoice.objects.select_related('student').filter(id=pk).first()
+    if not invoice:
+        return Response({'success': False, 'error': 'Рахунок не знайдено'}, status=404)
+
+    if role == 'student' and invoice.student_id != request.user.id:
+        return Response({'detail': 'Forbidden'}, status=403)
+    if role not in ('student', 'admin', 'superadmin'):
+        return Response({'detail': 'Forbidden'}, status=403)
+
+    try:
+        amount = Decimal(str(request.data.get('amount')))
+    except (InvalidOperation, TypeError, ValueError):
+        return Response({'success': False, 'error': 'Некоректна сума'}, status=400)
+
+    if amount <= 0:
+        return Response({'success': False, 'error': 'Сума має бути більшою за 0'}, status=400)
+
+    remaining = (invoice.amount or Decimal('0')) - (invoice.paid_amount or Decimal('0'))
+    if remaining <= 0:
+        return Response({'success': False, 'error': 'Рахунок вже сплачено'}, status=400)
+    if amount > remaining:
+        return Response({'success': False, 'error': 'Сума більша за залишок до сплати'}, status=400)
+
+    invoice.paid_amount = (invoice.paid_amount or Decimal('0')) + amount
+    if invoice.paid_amount >= invoice.amount:
+        invoice.paid_amount = invoice.amount
+        invoice.status = 'paid'
+        invoice.paid_at = timezone.now()
+    else:
+        invoice.status = 'partial'
+    invoice.save(update_fields=['paid_amount', 'status', 'paid_at'])
+
+    Notification.objects.create(
+        user=invoice.student,
+        type='invoice',
+        title='Оплату зафіксовано',
+        message=f'Зараховано оплату {float(amount)} грн. Статус: {invoice.status}.',
+    )
+
+    return Response({'success': True}, status=200)
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+@parser_classes([MultiPartParser, FormParser])
+def invoice_submit_receipt(request, pk):
+    from decimal import Decimal, InvalidOperation
+
+    role = _effective_role(getattr(request, 'user', None))
+    invoice = Invoice.objects.select_related('student').filter(id=pk).first()
+    if not invoice:
+        return Response({'success': False, 'error': 'Рахунок не знайдено'}, status=404)
+
+    if role != 'student' or invoice.student_id != request.user.id:
+        return Response({'detail': 'Forbidden'}, status=403)
+
+    receipt_file = request.FILES.get('receipt')
+    if not receipt_file:
+        return Response({'success': False, 'error': 'Додайте квитанцію'}, status=400)
+
+    try:
+        amount = Decimal(str(request.data.get('amount')))
+    except (InvalidOperation, TypeError, ValueError):
+        return Response({'success': False, 'error': 'Некоректна сума'}, status=400)
+    if amount <= 0:
+        return Response({'success': False, 'error': 'Сума має бути більшою за 0'}, status=400)
+
+    remaining = (invoice.amount or Decimal('0')) - (invoice.paid_amount or Decimal('0'))
+    if remaining <= 0:
+        return Response({'success': False, 'error': 'Рахунок вже сплачено'}, status=400)
+    if amount > remaining:
+        return Response({'success': False, 'error': 'Сума більша за залишок до сплати'}, status=400)
+
+    safe_name = get_valid_filename(receipt_file.name)
+    path = default_storage.save(f'invoice_receipts/{invoice.id}/{safe_name}', receipt_file)
+    url = default_storage.url(path)
+
+    note = (request.data.get('note') or '').strip() or None
+    rec = InvoicePaymentReceipt.objects.create(
+        invoice=invoice,
+        student=request.user,
+        amount=amount,
+        receipt_url=url,
+        receipt_name=safe_name,
+        status='pending',
+        note=note,
+    )
+
+    Notification.objects.create(
+        user=request.user,
+        type='invoice',
+        title='Квитанцію надіслано',
+        message='Квитанція надіслана на перевірку.',
+    )
+
+    return Response({'success': True, 'receipt': {'id': rec.id}}, status=201)
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def invoice_receipt_review(request, pk, receipt_id):
+    forbidden = _require_roles(request, ('admin', 'superadmin'))
+    if forbidden:
+        return forbidden
+
+    invoice = Invoice.objects.select_related('student').filter(id=pk).first()
+    if not invoice:
+        return Response({'success': False, 'error': 'Рахунок не знайдено'}, status=404)
+
+    receipt = InvoicePaymentReceipt.objects.select_related('student').filter(id=receipt_id, invoice_id=pk).first()
+    if not receipt:
+        return Response({'success': False, 'error': 'Квитанцію не знайдено'}, status=404)
+
+    action = str(request.data.get('action') or '').strip().lower()
+    if action not in ('approve', 'reject'):
+        return Response({'success': False, 'error': 'Некоректна дія'}, status=400)
+
+    receipt.reviewed_by = request.user
+    receipt.reviewed_at = timezone.now()
+
+    if action == 'reject':
+        note = (request.data.get('note') or '').strip() or None
+        receipt.status = 'rejected'
+        receipt.note = note
+        receipt.save(update_fields=['status', 'note', 'reviewed_by', 'reviewed_at'])
+        Notification.objects.create(
+            user=invoice.student,
+            type='invoice',
+            title='Квитанцію відхилено',
+            message=note or 'Квитанцію відхилено адміністратором.',
+        )
+        return Response({'success': True}, status=200)
+
+    # approve
+    receipt.status = 'approved'
+    receipt.note = None
+    receipt.save(update_fields=['status', 'note', 'reviewed_by', 'reviewed_at'])
+
+    remaining = (invoice.amount or 0) - (invoice.paid_amount or 0)
+    to_apply = receipt.amount
+    if to_apply > remaining:
+        to_apply = remaining
+    if to_apply and to_apply > 0:
+        invoice.paid_amount = (invoice.paid_amount or 0) + to_apply
+    if invoice.paid_amount >= invoice.amount:
+        invoice.paid_amount = invoice.amount
+        invoice.status = 'paid'
+        invoice.paid_at = timezone.now()
+    else:
+        invoice.status = 'partial'
+    invoice.save(update_fields=['paid_amount', 'status', 'paid_at'])
+
+    Notification.objects.create(
+        user=invoice.student,
+        type='invoice',
+        title='Оплату підтверджено',
+        message=f'Квитанцію підтверджено. Зараховано {float(to_apply)} грн.',
+    )
+    return Response({'success': True}, status=200)
 
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
@@ -2155,7 +2322,13 @@ def invoices_list(request):
             return Response({'detail': 'Forbidden'}, status=403)
         return create_invoice(request)
 
-    invoices_qs = Invoice.objects.select_related('student').order_by('-created_at').all()
+    invoices_qs = (
+        Invoice.objects
+        .select_related('student')
+        .prefetch_related('receipts')
+        .order_by('-created_at')
+        .all()
+    )
     if role == 'student':
         invoices_qs = invoices_qs.filter(student=request.user)
     elif role not in ('admin', 'superadmin'):
@@ -2163,6 +2336,14 @@ def invoices_list(request):
 
     data = []
     for i in invoices_qs:
+        latest_receipt = None
+        try:
+            receipts = list(i.receipts.all())
+            receipts.sort(key=lambda r: (r.created_at or timezone.now()), reverse=True)
+            latest_receipt = receipts[0] if receipts else None
+        except Exception:
+            latest_receipt = None
+
         data.append({
             'id': i.id,
             'studentId': i.student.id,
@@ -2176,7 +2357,19 @@ def invoices_list(request):
             'dueDate': i.due_date.isoformat() if i.due_date else '',
             'createdAt': i.created_at.isoformat() if i.created_at else '',
             'description': i.description or '',
-            'latestReceipt': None,
+            'latestReceipt': (
+                {
+                    'id': latest_receipt.id,
+                    'amount': float(latest_receipt.amount),
+                    'receiptUrl': latest_receipt.receipt_url,
+                    'receiptName': latest_receipt.receipt_name,
+                    'status': latest_receipt.status,
+                    'note': latest_receipt.note or '',
+                    'createdAt': latest_receipt.created_at.isoformat() if latest_receipt.created_at else '',
+                }
+                if latest_receipt
+                else None
+            ),
         })
     return Response(data)
 
