@@ -3933,7 +3933,7 @@ def puzzles_list(request):
                 'difficulty': puzzle.difficulty,
                 'points': puzzle.points,
                 'solved_by': puzzle.solved_by,
-                'created_at': puzzle.created_at
+                'created_at': puzzle.created_at.isoformat() if puzzle.created_at else ''
             }
         }, status=201)
 
@@ -3948,7 +3948,7 @@ def puzzles_list(request):
         'difficulty': p.difficulty,
         'points': p.points,
         'solved_by': p.solved_by,
-        'created_at': p.created_at
+        'created_at': p.created_at.isoformat() if p.created_at else ''
     } for p in puzzles])
 
 
@@ -4023,6 +4023,7 @@ def puzzle_answer(request, pk):
             return Response({
                 'success': True,
                 'correct': True,
+                'already_solved': True,
                 'points': 0,
                 'message': 'Правильно! Ви вже отримали бали за цю загадку.',
             })
@@ -4046,15 +4047,17 @@ def puzzle_answer(request, pk):
         return Response({
             'success': True,
             'correct': True,
+            'already_solved': False,
             'points': puzzle.points,
             'message': f'Правильно! Ви отримали {puzzle.points} балів!'
         })
 
     return Response({
-        'success': False,
+        'success': True,
         'correct': False,
+        'already_solved': False,
         'message': 'Неправильна відповідь. Спробуйте ще раз!'
-    }, status=400)
+    }, status=200)
 
 
 # ===== LEARNING MATERIALS =====
