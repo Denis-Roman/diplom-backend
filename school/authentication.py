@@ -3,6 +3,7 @@ from django.conf import settings
 from rest_framework.authentication import BaseAuthentication
 from rest_framework.exceptions import AuthenticationFailed
 from school.models import User
+from school.models import GroupStudent
 
 
 class JWTAuthentication(BaseAuthentication):
@@ -33,5 +34,13 @@ class JWTAuthentication(BaseAuthentication):
             user = User.objects.get(pk=payload['userId'])
         except User.DoesNotExist:
             raise AuthenticationFailed('User not found')
+
+        # If legacy data has membership in GroupStudents but Users.group is null,
+        # patch it for the current request to keep API filters working.
+        if getattr(user, 'role', None) == 'student' and getattr(user, 'group_id', None) is None:
+            membership = GroupStudent.objects.select_related('group').filter(student=user).first()
+            if membership and membership.group_id:
+                user.group = membership.group
+                user.group_id = membership.group_id
 
         return (user, token)

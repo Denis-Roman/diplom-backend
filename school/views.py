@@ -881,18 +881,33 @@ def students_list(request):
 
     # --- Ось тут має бути визначення students!
     students = User.objects.select_related('group').filter(role='student')
-    return Response([{
-        "id": u.id,
-        "name": u.name,
-        "email": u.email,
-        "is_active": u.is_active
-        ,
-        "group": {
-            "id": u.group.id,
-            "name": u.group.name,
-            "color": u.group.color,
-        } if getattr(u, 'group', None) else None,
-    } for u in students])
+
+    # Map studentId -> group (fallback for legacy data where Users.group is null).
+    memberships = (
+        GroupStudent.objects
+        .select_related('group')
+        .filter(student_id__in=students.values_list('id', flat=True))
+    )
+    group_by_student_id: dict[int, Group] = {}
+    for m in memberships:
+        # If multiple groups exist (unexpected), keep the first.
+        group_by_student_id.setdefault(int(m.student_id), m.group)
+
+    payload = []
+    for u in students:
+        g = getattr(u, 'group', None) or group_by_student_id.get(int(u.id))
+        payload.append({
+            "id": u.id,
+            "name": u.name,
+            "email": u.email,
+            "is_active": u.is_active,
+            "group": {
+                "id": g.id,
+                "name": g.name,
+                "color": g.color,
+            } if g else None,
+        })
+    return Response(payload)
 
 @api_view(['GET', 'PUT', 'DELETE'])
 @permission_classes([IsAuthenticated])
