@@ -3370,8 +3370,37 @@ def puzzle_answer(request, pk):
     correct_answer = puzzle.answer.strip().lower()
 
     if answer == correct_answer:
+        # Prevent double scoring for the same puzzle by the same student.
+        already_scored = StudentPoint.objects.filter(
+            student=request.user,
+            source_type='puzzle',
+            source_id=puzzle.id,
+        ).exists()
+
+        if already_scored:
+            return Response({
+                'success': True,
+                'correct': True,
+                'points': 0,
+                'message': 'Правильно! Ви вже отримали бали за цю загадку.',
+            })
+
         puzzle.solved_by += 1
         puzzle.save()
+
+        StudentPoint.objects.create(
+            student=request.user,
+            points=int(getattr(puzzle, 'points', 0) or 0),
+            source_type='puzzle',
+            source_id=puzzle.id,
+            description=f'Загадка: {puzzle.title}',
+        )
+
+        membership = TeamMember.objects.filter(student=request.user).select_related('team').first()
+        if membership and membership.team:
+            membership.team.total_points = (membership.team.total_points or 0) + int(getattr(puzzle, 'points', 0) or 0)
+            membership.team.save(update_fields=['total_points'])
+
         return Response({
             'success': True,
             'correct': True,
