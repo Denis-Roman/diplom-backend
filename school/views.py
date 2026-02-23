@@ -4074,10 +4074,10 @@ def notifications_list(request):
                 'id': n.id,
                 'type': n.type,
                 'title': n.title,
-                'message': n.message,
-                'is_read': n.is_read,
-                'link': n.link,
-                'created_at': n.created_at,
+                'message': n.message or '',
+                'is_read': bool(n.is_read),
+                'link': n.link or None,
+                'created_at': n.created_at.isoformat() if n.created_at else '',
             }
             for n in notifications
         ]
