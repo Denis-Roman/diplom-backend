@@ -3477,127 +3477,59 @@ def teams_list(request):
     if request.method == 'POST':
         if role not in ('admin', 'superadmin'):
             return Response({'detail': 'Forbidden'}, status=403)
-        name = request.data.get('name', '')
+        name = (request.data.get('name', '') or '').strip()
         if not name:
             return Response({'success': False, 'error': 'Назва команди обов\'язкова'}, status=400)
-        team = Team.objects.create(name=name, description=request.data.get('description', ''),
-                                   color=request.data.get('color', '#FF9A00'))
+        team = Team.objects.create(
+            name=name,
+            description=(request.data.get('description', '') or '').strip(),
+            color=(request.data.get('color', '#FF9A00') or '#FF9A00').strip(),
+        )
         return Response({'success': True, 'team': {'id': team.id, 'name': team.name}}, status=201)
 
     # GET - повертаємо команди зі студентами
-    teams = Team.objects.all()
+    teams = Team.objects.all().order_by('-created_at')
+    team_ids = list(teams.values_list('id', flat=True))
+
+    memberships = (
+        TeamMember.objects
+        .select_related('student', 'team')
+        .filter(team_id__in=team_ids)
+        .all()
+    )
+    student_ids = list({int(m.student_id) for m in memberships})
+    points_rows = (
+        StudentPoint.objects
+        .filter(student_id__in=student_ids)
+        .values('student_id')
+        .annotate(total=Sum('points'))
+    )
+    points_by_student_id = {int(r['student_id']): int(r.get('total') or 0) for r in points_rows}
+
+    members_by_team_id: dict[int, list[dict]] = {}
+    for m in memberships:
+        members_by_team_id.setdefault(int(m.team_id), []).append(
+            {
+                'id': m.student.id,
+                'name': m.student.name,
+                'email': m.student.email,
+                'points': points_by_student_id.get(int(m.student_id), 0),
+            }
+        )
+
     result = []
     for team in teams:
-        # Отримуємо студентів команди
-        team_members = TeamMember.objects.filter(team=team).select_related('student')
-        members_data = [{
-            'id': tm.student.id,
-            'name': tm.student.name,
-            'email': tm.student.email
-        } for tm in team_members]
-
-        result.append({
-            'id': team.id,
-            'name': team.name,
-            'description': team.description,
-            'color': team.color,
-            'total_points': team.total_points,
-            'created_at': team.created_at,
-            'members': members_data
-        })
-
-    return Response(result)
-
-    @api_view(['POST'])
-    @permission_classes([AllowAny])
-    def team_add_members(request, pk):
-        """Додати студентів до команди"""
-        try:
-            team = Team.objects.get(id=pk)
-        except Team.DoesNotExist:
-            return Response({'success': False, 'error': 'Команда не знайдена'}, status=404)
-
-        student_ids = request.data.get('student_ids', [])
-
-        if not student_ids:
-            return Response({'success': False, 'error': 'Не вказано студентів'}, status=400)
-
-        added_count = 0
-        errors = []
-
-        for student_id in student_ids:
-            try:
-                student = User.objects.get(id=student_id, role='student')
-
-                # Перевіряємо чи студент вже в ІНШІЙ команді
-                existing_membership = TeamMember.objects.filter(student=student).first()
-                if existing_membership:
-                    if existing_membership.team.id == team.id:
-                        errors.append(f'{student.name} вже в цій команді')
-                    else:
-                        errors.append(f'{student.name} вже в команді "{existing_membership.team.name}"')
-                    continue
-
-                # Додаємо студента до команди
-                TeamMember.objects.create(team=team, student=student)
-                added_count += 1
-
-            except User.DoesNotExist:
-                continue
-
-        message = f'Додано {added_count} студентів'
-        if errors:
-            message += '. Помилки: ' + '; '.join(errors)
-
-        return Response({
-            'success': True,
-            'message': message,
-            'added': added_count,
-            'errors': errors
-        })
-
-    @api_view(['POST'])
-    @permission_classes([AllowAny])
-    def team_remove_member(request, pk):
-        """Видалити студента з команди"""
-        try:
-            team = Team.objects.get(id=pk)
-        except Team.DoesNotExist:
-            return Response({'success': False, 'error': 'Команда не знайдена'}, status=404)
-
-        student_id = request.data.get('student_id')
-
-        if not student_id:
-            return Response({'success': False, 'error': 'Не вказано студента'}, status=400)
-
-        try:
-            student = User.objects.get(id=student_id, role='student')
-            TeamMember.objects.filter(team=team, student=student).delete()
-            return Response({'success': True, 'message': 'Студента видалено з команди'})
-        except User.DoesNotExist:
-            return Response({'success': False, 'error': 'Студент не знайдений'}, status=404)
-
-    # GET - повертаємо команди зі студентами
-    teams = Team.objects.all()
-    result = []
-    for team in teams:
-        # Отримуємо студентів команди
-        team_members = TeamMember.objects.filter(team=team).select_related('student')
-        members_data = [{
-            'id': tm.student.id,
-            'name': tm.student.name,
-            'email': tm.student.email
-        } for tm in team_members]
-
-        result.append({
-            'id': team.id,
-            'name': team.name,
-            'description': team.description,
-            'color': team.color,
-            'total_points': team.total_points,
-            'created_at': team.created_at,
-            'members': members_data  # ✅ Додаємо список студентів
-        })
+        result.append(
+            {
+                'id': team.id,
+                'name': team.name,
+                'description': team.description or '',
+                'color': team.color,
+                'total_points': int(getattr(team, 'total_points', 0) or 0),
+                'created_at': team.created_at.isoformat() if team.created_at else '',
+                'members': members_by_team_id.get(int(team.id), []),
+            }
+        )
 
     return Response(result)
 
@@ -3686,12 +3618,24 @@ def team_detail(request, pk):
         return Response({'success': False, 'error': 'Команда не знайдена'}, status=404)
     if request.method == 'GET':
         return Response(
-            {'id': team.id, 'name': team.name, 'description': team.description, 'total_points': team.total_points})
+            {
+                'id': team.id,
+                'name': team.name,
+                'description': team.description or '',
+                'color': team.color,
+                'total_points': int(getattr(team, 'total_points', 0) or 0),
+                'created_at': team.created_at.isoformat() if team.created_at else '',
+            }
+        )
     if request.method == 'PUT':
         if role not in ('admin', 'superadmin'):
             return Response({'detail': 'Forbidden'}, status=403)
-        team.name = request.data.get('name', team.name)
-        team.save()
+        team.name = (request.data.get('name', team.name) or team.name).strip()
+        team.description = request.data.get('description', team.description)
+        color = request.data.get('color', team.color)
+        if isinstance(color, str) and color.strip():
+            team.color = color.strip()
+        team.save(update_fields=['name', 'description', 'color'])
         return Response({'success': True})
     if request.method == 'DELETE':
         if role not in ('admin', 'superadmin'):
