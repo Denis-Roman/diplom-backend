@@ -61,6 +61,7 @@ urlpatterns = [
     # Invoices
     path('invoices/', views.invoices_list, name='invoices-list'),
     path('invoices/history/', views.invoices_history, name='invoices-history'),
+    path('invoices/<int:pk>/remind/', views.invoice_remind, name='invoice-remind'),
 
     # Admin
     path('admin/stats/', views.admin_stats, name='admin-stats'),

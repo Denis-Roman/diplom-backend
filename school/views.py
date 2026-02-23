@@ -242,28 +242,67 @@ def create_invoice(request):
     if not due_date:
         return Response({'success': False, 'error': 'Некоректна дата платежу'}, status=400)
 
-    # Перевірка дати платежу проти дати реєстрації
+    def _user_registration_date(user: User):
+        """Return best-effort registration date (local TZ) for validations.
+
+        We use the maximum of:
+        - User.registered_at (DateField)
+        - local date of User.created_at (DateTimeField)
+
+        This avoids edge cases around midnight/UTC where created_at/registered_at
+        can appear as previous day.
+        """
+
+        reg = getattr(user, 'registered_at', None)
+        if isinstance(reg, datetime.datetime):
+            try:
+                reg = timezone.localtime(reg).date()
+            except Exception:
+                reg = reg.date()
+        if not isinstance(reg, datetime.date):
+            reg = None
+
+        created_at = getattr(user, 'created_at', None)
+        created_date = None
+        if isinstance(created_at, datetime.datetime):
+            try:
+                created_date = timezone.localtime(created_at).date()
+            except Exception:
+                created_date = created_at.date()
+
+        if reg and created_date:
+            return max(reg, created_date)
+        return reg or created_date
+
+    # Перевірка дати платежу проти дати реєстрації (важливо для масового виставлення)
     students_qs = User.objects.filter(id__in=students)
     found_ids = set(students_qs.values_list('id', flat=True))
     missing = [sid for sid in students if sid not in found_ids]
     if missing:
         return Response({'success': False, 'error': f'Учні не знайдені: {missing}'}, status=404)
 
+    invalid_students = []
     for student in students_qs:
-        reg_date = getattr(student, 'registered_at', None)
-        if isinstance(reg_date, datetime.datetime):
-            reg_date = reg_date.date()
+        reg_date = _user_registration_date(student)
         if reg_date and due_date < reg_date:
-            return Response(
+            invalid_students.append(
                 {
-                    'success': False,
-                    'error': (
-                        f'Дата платежу для {student.name} раніше дати реєстрації: '
-                        f'{reg_date.isoformat()}'
-                    ),
-                },
-                status=400,
+                    'id': student.id,
+                    'name': student.name,
+                    'email': student.email,
+                    'registeredAt': reg_date.isoformat(),
+                }
             )
+
+    if invalid_students:
+        return Response(
+            {
+                'success': False,
+                'error': 'Дата платежу не може бути раніше дати реєстрації учня',
+                'invalidStudents': invalid_students,
+            },
+            status=400,
+        )
 
     # Створення рахунка для кожного студента
     result = []
@@ -289,6 +328,32 @@ def create_invoice(request):
             result.append({'invoice_id': inv.id, 'installment': i + 1})
 
     return Response({'success': True, 'created': result}, status=201)
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def invoice_remind(request, pk):
+    forbidden = _require_roles(request, ('admin', 'superadmin'))
+    if forbidden:
+        return forbidden
+
+    invoice = Invoice.objects.select_related('student').filter(id=pk).first()
+    if not invoice:
+        return Response({'success': False, 'error': 'Рахунок не знайдено'}, status=404)
+
+    student = invoice.student
+    due_label = invoice.due_date.isoformat() if getattr(invoice, 'due_date', None) else ''
+    Notification.objects.create(
+        user=student,
+        type='invoice',
+        title='Нагадування про оплату',
+        message=f'Нагадування: рахунок на {float(invoice.amount)} грн до {due_label}.',
+    )
+
+    return Response(
+        {'success': True, 'message': f'Нагадування надіслано: {student.email}'},
+        status=200,
+    )
 
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
