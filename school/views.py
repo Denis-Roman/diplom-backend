@@ -3534,6 +3534,8 @@ def users_list(request):
                 group = Group.objects.get(id=group_id)
                 user.group = group
                 user.save()
+                if user.role == 'student':
+                    GroupStudent.objects.get_or_create(group=group, student=user)
             except Group.DoesNotExist:
                 pass
 
