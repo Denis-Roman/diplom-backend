@@ -2576,6 +2576,7 @@ def achievements_me(request):
 
 @api_view(['GET', 'POST'])
 @permission_classes([IsAuthenticated])
+@parser_classes([MultiPartParser, FormParser])
 def news_list(request):
     role = _effective_role(getattr(request, 'user', None))
     if request.method == 'POST':
@@ -2588,6 +2589,12 @@ def news_list(request):
         image_url = request.data.get('image_url', '')
         video_url = request.data.get('video_url', '')
         link = request.data.get('link', '')
+
+        image_file = request.FILES.get('image_file')
+        if image_file:
+            safe_name = get_valid_filename(getattr(image_file, 'name', 'image'))
+            stored_path = default_storage.save(f"news_images/{safe_name}", image_file)
+            image_url = default_storage.url(stored_path)
 
         # ГОЛОВНЕ! каст bool для is_published (приходить як "true"/"false" — string)
         is_published_raw = request.data.get('is_published', 'false')
@@ -2619,7 +2626,7 @@ def news_list(request):
             'id': n.id,
             'title': n.title,
             'content': n.content,
-            'created_at': n.created_at,
+            'created_at': n.created_at.isoformat() if n.created_at else '',
             'is_published': n.is_published,
             'category': n.category,
             'image_url': n.image_url,
@@ -2631,6 +2638,7 @@ def news_list(request):
 
 @api_view(['GET', 'PUT', 'DELETE'])
 @permission_classes([IsAuthenticated])
+@parser_classes([MultiPartParser, FormParser])
 def news_detail(request, pk):
     role = _effective_role(getattr(request, 'user', None))
     try:
@@ -2649,7 +2657,7 @@ def news_detail(request, pk):
             'id': news.id,
             'title': news.title,
             'content': news.content,
-            'created_at': news.created_at,
+            'created_at': news.created_at.isoformat() if news.created_at else '',
             'is_published': news.is_published,
             'category': news.category,
             'image_url': news.image_url,
@@ -2663,8 +2671,24 @@ def news_detail(request, pk):
         news.title = request.data.get('title', news.title)
         news.content = request.data.get('content', news.content)
         news.category = request.data.get('category', news.category)
-        news.is_published = request.data.get('is_published', news.is_published)
-        news.image_url = request.data.get('image_url', news.image_url)
+
+        is_published_raw = request.data.get('is_published', news.is_published)
+        if isinstance(is_published_raw, bool):
+            is_published = is_published_raw
+        else:
+            is_published = str(is_published_raw).lower() in ('true', '1', 'yes')
+        if is_published != news.is_published:
+            news.is_published = is_published
+            news.published_at = timezone.now() if is_published else None
+
+        image_url = request.data.get('image_url', news.image_url)
+        image_file = request.FILES.get('image_file')
+        if image_file:
+            safe_name = get_valid_filename(getattr(image_file, 'name', 'image'))
+            stored_path = default_storage.save(f"news_images/{safe_name}", image_file)
+            image_url = default_storage.url(stored_path)
+        news.image_url = image_url
+
         news.video_url = request.data.get('video_url', news.video_url)
         news.link = request.data.get('link', news.link)
         news.save()
