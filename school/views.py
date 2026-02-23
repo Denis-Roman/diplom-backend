@@ -32,7 +32,7 @@ from school.models import (
     Attendance, Invoice, Notification, News, ExtraNews, StudentPoint,
     Team, TeamMember, Chat, ChatParticipant, ChatMessage, ChatMessageAttachment, Poll,
     PollOption, CourseMaterial, CourseTest, TestQuestion, QuestionOption, PollVote, Course, Puzzle, LearningMaterial,
-    TaskSubmission, SubmissionFile, InvoicePaymentReceipt,
+    TaskSubmission, SubmissionFile, InvoicePaymentReceipt, LearningMaterialAttachment,
 )
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import AllowAny
@@ -3884,16 +3884,126 @@ def learning_materials_list(request):
     if request.method == 'POST':
         if role not in ('admin', 'superadmin'):
             return Response({'detail': 'Forbidden'}, status=403)
-        title = request.data.get('title', '')
+        title = (request.data.get('title', '') or '').strip()
         if not title:
             return Response({'success': False, 'error': 'Назва обов\'язкова'}, status=400)
-        material = LearningMaterial.objects.create(title=title, description=request.data.get('description', ''),
-                                                   type=request.data.get('type', 'material'))
-        return Response({'success': True, 'material': {'id': material.id, 'title': material.title}}, status=201)
-    materials = LearningMaterial.objects.all()
+
+        description = (request.data.get('description', '') or '').strip()
+        material_type = (request.data.get('type', 'material') or 'material').strip()
+        is_published_raw = request.data.get('is_published', True)
+        is_published = bool(is_published_raw)
+        if isinstance(is_published_raw, str):
+            is_published = is_published_raw.lower() in ('true', '1', 'yes')
+
+        group = None
+        subject = None
+        group_id = request.data.get('group_id')
+        subject_id = request.data.get('subject_id')
+        if group_id:
+            try:
+                group = Group.objects.get(id=int(group_id))
+            except Exception:
+                group = None
+        if subject_id:
+            try:
+                subject = Subject.objects.get(id=int(subject_id))
+            except Exception:
+                subject = None
+
+        material = LearningMaterial.objects.create(
+            title=title,
+            description=description,
+            type=material_type,
+            group=group,
+            subject=subject,
+            is_published=is_published,
+        )
+
+        attachments = request.data.get('attachments', [])
+        if isinstance(attachments, list):
+            for a in attachments:
+                if not isinstance(a, dict):
+                    continue
+                a_type = str(a.get('type') or '').strip() or 'file'
+                a_name = str(a.get('name') or '').strip() or 'attachment'
+                a_url = str(a.get('url') or '').strip() or None
+                a_size = a.get('file_size')
+                LearningMaterialAttachment.objects.create(
+                    material=material,
+                    type=a_type,
+                    name=a_name,
+                    url=a_url,
+                    file_size=str(a_size) if a_size is not None else None,
+                )
+
+        return Response(
+            {
+                'success': True,
+                'material': {
+                    'id': material.id,
+                    'title': material.title,
+                },
+            },
+            status=201,
+        )
+
+    materials = LearningMaterial.objects.select_related('subject', 'group').prefetch_related('attachments').all()
     if role == 'student':
+        effective_group_id = getattr(request.user, 'group_id', None)
+        if not effective_group_id:
+            effective_group_id = (
+                GroupStudent.objects.filter(student_id=request.user.id)
+                .values_list('group_id', flat=True)
+                .first()
+            )
         materials = materials.filter(is_published=True)
-    return Response([{'id': m.id, 'title': m.title, 'type': m.type, 'description': m.description} for m in materials])
+        if effective_group_id:
+            materials = materials.filter(models.Q(group_id__isnull=True) | models.Q(group_id=effective_group_id))
+        else:
+            materials = materials.filter(group_id__isnull=True)
+
+    payload = []
+    for m in materials.order_by('-created_at'):
+        payload.append(
+            {
+                'id': m.id,
+                'title': m.title,
+                'type': m.type,
+                'description': m.description,
+                'created_at': m.created_at.isoformat() if m.created_at else '',
+                'is_published': bool(m.is_published),
+                'subject': (
+                    {
+                        'id': m.subject.id,
+                        'name': m.subject.name,
+                        'short_name': m.subject.short_name,
+                        'color': m.subject.color,
+                    }
+                    if m.subject
+                    else None
+                ),
+                'group': (
+                    {
+                        'id': m.group.id,
+                        'name': m.group.name,
+                        'color': m.group.color,
+                    }
+                    if m.group
+                    else None
+                ),
+                'attachments': [
+                    {
+                        'id': a.id,
+                        'type': a.type,
+                        'name': a.name,
+                        'url': a.url,
+                        'file_size': a.file_size,
+                    }
+                    for a in getattr(m, 'attachments', []).all()
+                ],
+            }
+        )
+    return Response(payload)
 
 
 @api_view(['GET', 'PUT', 'DELETE'])
@@ -3911,13 +4021,95 @@ def learning_material_detail(request, pk):
         return Response({'detail': 'Forbidden'}, status=403)
     if request.method == 'GET':
         return Response(
-            {'id': material.id, 'title': material.title, 'description': material.description, 'type': material.type})
+            {
+                'id': material.id,
+                'title': material.title,
+                'description': material.description,
+                'type': material.type,
+                'created_at': material.created_at.isoformat() if material.created_at else '',
+                'is_published': bool(material.is_published),
+                'subject': (
+                    {
+                        'id': material.subject.id,
+                        'name': material.subject.name,
+                        'short_name': material.subject.short_name,
+                        'color': material.subject.color,
+                    }
+                    if material.subject
+                    else None
+                ),
+                'group': (
+                    {
+                        'id': material.group.id,
+                        'name': material.group.name,
+                        'color': material.group.color,
+                    }
+                    if material.group
+                    else None
+                ),
+                'attachments': [
+                    {
+                        'id': a.id,
+                        'type': a.type,
+                        'name': a.name,
+                        'url': a.url,
+                        'file_size': a.file_size,
+                    }
+                    for a in material.attachments.all()
+                ],
+            }
+        )
     if request.method == 'PUT':
         if role not in ('admin', 'superadmin'):
             return Response({'detail': 'Forbidden'}, status=403)
-        material.title = request.data.get('title', material.title)
+        material.title = (request.data.get('title', material.title) or material.title).strip()
         material.description = request.data.get('description', material.description)
+
+        is_published_raw = request.data.get('is_published', material.is_published)
+        if isinstance(is_published_raw, bool):
+            material.is_published = is_published_raw
+        else:
+            material.is_published = str(is_published_raw).lower() in ('true', '1', 'yes')
+
+        group_id = request.data.get('group_id')
+        subject_id = request.data.get('subject_id')
+        if group_id is not None:
+            if str(group_id).strip() == '':
+                material.group = None
+            else:
+                try:
+                    material.group = Group.objects.get(id=int(group_id))
+                except Exception:
+                    pass
+        if subject_id is not None:
+            if str(subject_id).strip() == '':
+                material.subject = None
+            else:
+                try:
+                    material.subject = Subject.objects.get(id=int(subject_id))
+                except Exception:
+                    pass
+
         material.save()
+
+        attachments = request.data.get('attachments', None)
+        if isinstance(attachments, list):
+            material.attachments.all().delete()
+            for a in attachments:
+                if not isinstance(a, dict):
+                    continue
+                a_type = str(a.get('type') or '').strip() or 'file'
+                a_name = str(a.get('name') or '').strip() or 'attachment'
+                a_url = str(a.get('url') or '').strip() or None
+                a_size = a.get('file_size')
+                LearningMaterialAttachment.objects.create(
+                    material=material,
+                    type=a_type,
+                    name=a_name,
+                    url=a_url,
+                    file_size=str(a_size) if a_size is not None else None,
+                )
+
         return Response({'success': True})
     if request.method == 'DELETE':
         if role not in ('admin', 'superadmin'):
