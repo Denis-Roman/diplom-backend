@@ -1610,11 +1610,12 @@ def tasks_list(request):
         subject = None
 
         group_id = request.data.get('group_id')
-        if group_id:
-            try:
-                group = Group.objects.get(id=group_id)
-            except Group.DoesNotExist:
-                pass
+        if not group_id:
+            return Response({'success': False, 'error': 'Оберіть групу'}, status=400)
+        try:
+            group = Group.objects.get(id=group_id)
+        except Group.DoesNotExist:
+            return Response({'success': False, 'error': 'Групу не знайдено'}, status=404)
 
         subject_id = request.data.get('subject_id')
         if subject_id:
@@ -1650,8 +1651,15 @@ def tasks_list(request):
     # GET - повертаємо всі завдання з повною інформацією
     tasks = Task.objects.select_related('subject', 'group').all()
     if role == 'student':
-        if getattr(request.user, 'group_id', None):
-            tasks = tasks.filter(group_id=request.user.group_id)
+        effective_group_id = getattr(request.user, 'group_id', None)
+        if not effective_group_id:
+            effective_group_id = (
+                GroupStudent.objects.filter(student_id=request.user.id)
+                .values_list('group_id', flat=True)
+                .first()
+            )
+        if effective_group_id:
+            tasks = tasks.filter(group_id=effective_group_id)
         else:
             tasks = tasks.none()
     result = []
