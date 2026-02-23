@@ -2049,6 +2049,20 @@ def attendance_bulk_update(request):
             lesson_id=lesson_id,
             defaults={'status': status}
         )
+
+        # Sync student's group with the lesson's group for consistency.
+        try:
+            lesson = Lesson.objects.select_related('group').get(id=lesson_id)
+            if lesson.group_id:
+                student = User.objects.filter(id=user_id, role='student').first()
+                if student:
+                    GroupStudent.objects.get_or_create(group_id=lesson.group_id, student_id=student.id)
+                    if getattr(student, 'group_id', None) != lesson.group_id:
+                        student.group_id = lesson.group_id
+                        student.save(update_fields=['group'])
+        except Exception:
+            pass
+
         if is_new:
             created += 1
         else:
