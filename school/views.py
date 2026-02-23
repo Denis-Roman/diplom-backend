@@ -3072,6 +3072,32 @@ def chat_messages(request, pk):
 @permission_classes([IsAuthenticated])
 def polls_list(request):
     role = _effective_role(getattr(request, 'user', None))
+
+    def _parse_bool(value, default=False):
+        if value is None:
+            return default
+        if isinstance(value, bool):
+            return value
+        s = str(value).strip().lower()
+        if s in ('1', 'true', 'yes', 'y', 'on'):
+            return True
+        if s in ('0', 'false', 'no', 'n', 'off', ''):
+            return False
+        return default
+
+    def _parse_iso_date(value):
+        if value is None:
+            return None
+        if isinstance(value, date):
+            return value
+        s = str(value).strip()
+        if not s:
+            return None
+        try:
+            return datetime.datetime.strptime(s[:10], '%Y-%m-%d').date()
+        except Exception:
+            return None
+
     if request.method == 'POST':
         if role not in ('admin', 'superadmin'):
             return Response({'detail': 'Forbidden'}, status=403)
@@ -3079,15 +3105,15 @@ def polls_list(request):
         options = request.data.get('options', [])
         target_type = request.data.get('targetType', 'all')
         group_ids = request.data.get('groupIds', [])
-        is_anonymous = request.data.get('isAnonymous', False)
-        is_multiple_choice = request.data.get('isMultipleChoice', False)
-        ends_at = request.data.get('endsAt')
+        is_anonymous = _parse_bool(request.data.get('isAnonymous', False), default=False)
+        is_multiple_choice = _parse_bool(request.data.get('isMultipleChoice', False), default=False)
+        ends_at = _parse_iso_date(request.data.get('endsAt'))
 
         # Валідація
-        if not title or len(options) < 2 or not ends_at:
+        if not title or not isinstance(options, list) or len(options) < 2 or not ends_at:
             return Response({'success': False, 'error': 'Перевірте всі обовʼязкові поля'}, status=400)
         # Дата не раніше сьогодні
-        if ends_at < str(date.today()):
+        if ends_at < date.today():
             return Response({'success': False, 'error': 'Дата закриття некоректна'}, status=400)
 
         poll = Poll.objects.create(
@@ -3100,16 +3126,18 @@ def polls_list(request):
         )
         # Окремо додаємо групи
         if target_type == "group" and isinstance(group_ids, list):
-            for gid in group_ids:
+            gid = group_ids[0] if len(group_ids) > 0 else None
+            if gid is not None and str(gid).strip() != '':
                 try:
-                    g = Group.objects.get(id=gid)
-                    poll.target_group = g
-                    poll.save()
-                except:
+                    poll.target_group = Group.objects.get(id=int(gid))
+                    poll.save(update_fields=['target_group'])
+                except Exception:
                     pass
 
         for o in options:
-            PollOption.objects.create(poll=poll, text=o['text'])
+            text = (o.get('text') if isinstance(o, dict) else None) or ''
+            if str(text).strip():
+                PollOption.objects.create(poll=poll, text=str(text).strip())
 
         return Response({'success': True, 'pollId': poll.id})
 
@@ -3118,12 +3146,29 @@ def polls_list(request):
     polls_qs = Poll.objects.all().order_by('-created_at')
     if role == 'student':
         polls_qs = polls_qs.exclude(status='draft')
-        if getattr(request.user, 'group_id', None):
-            polls_qs = polls_qs.filter(models.Q(target_type='all') | models.Q(target_type='group', target_group_id=request.user.group_id))
+        effective_group_id = getattr(request.user, 'group_id', None)
+        if not effective_group_id:
+            effective_group_id = (
+                GroupStudent.objects.filter(student_id=request.user.id)
+                .values_list('group_id', flat=True)
+                .first()
+            )
+        if effective_group_id:
+            polls_qs = polls_qs.filter(
+                models.Q(target_type='all') |
+                models.Q(target_type='group', target_group_id=effective_group_id)
+            )
         else:
             polls_qs = polls_qs.filter(target_type='all')
 
     for poll in polls_qs:
+        voters_count = (
+            PollVote.objects
+            .filter(option__poll=poll)
+            .values('student_id')
+            .distinct()
+            .count()
+        )
         result.append({
             'id': poll.id,
             'title': poll.title,
@@ -3137,6 +3182,7 @@ def polls_list(request):
             'endsAt': poll.ends_at.isoformat(),
             'createdAt': poll.created_at.isoformat() if poll.created_at else '',
             'status': poll.status,
+            'votersCount': voters_count,
         })
     return Response(result)
 
@@ -3165,11 +3211,27 @@ def poll_detail(request, pk):
             poll.title = request.data.get('title', poll.title)
             poll.description = request.data.get('description', poll.description)
             poll.target_type = request.data.get('targetType', poll.target_type)
-            poll.is_anonymous = bool(request.data.get('isAnonymous', poll.is_anonymous))
-            poll.is_multiple_choice = bool(request.data.get('isMultipleChoice', poll.is_multiple_choice))
+            def _parse_bool(value, default=False):
+                if value is None:
+                    return default
+                if isinstance(value, bool):
+                    return value
+                s = str(value).strip().lower()
+                if s in ('1', 'true', 'yes', 'y', 'on'):
+                    return True
+                if s in ('0', 'false', 'no', 'n', 'off', ''):
+                    return False
+                return default
+
+            poll.is_anonymous = _parse_bool(request.data.get('isAnonymous', poll.is_anonymous), default=bool(poll.is_anonymous))
+            poll.is_multiple_choice = _parse_bool(request.data.get('isMultipleChoice', poll.is_multiple_choice), default=bool(poll.is_multiple_choice))
+
             ends_at = request.data.get('endsAt')
-            if ends_at:
-                poll.ends_at = ends_at
+            if ends_at is not None and str(ends_at).strip():
+                try:
+                    poll.ends_at = datetime.datetime.strptime(str(ends_at)[:10], '%Y-%m-%d').date()
+                except Exception:
+                    pass
 
             group_ids = request.data.get('groupIds', [])
             if poll.target_type == 'group' and isinstance(group_ids, list) and len(group_ids) > 0:
@@ -3225,13 +3287,24 @@ def poll_vote(request, pk):
     Додати голосування: pk - option.id, student_id в тілі
     """
     try:
-        option = PollOption.objects.get(id=pk)
+        option = PollOption.objects.select_related('poll').get(id=pk)
         role = _effective_role(getattr(request, 'user', None))
         if role != 'student':
             return Response({'detail': 'Forbidden'}, status=403)
         student = request.user
 
-        # Захист від подвійного голосу:
+        poll = option.poll
+        if poll.status != 'active':
+            return Response({'success': False, 'error': 'Опитування закрите'}, status=400)
+        if poll.ends_at and poll.ends_at < date.today():
+            return Response({'success': False, 'error': 'Термін опитування минув'}, status=400)
+
+        # Single-choice: block if student already voted in this poll.
+        if not bool(getattr(poll, 'is_multiple_choice', False)):
+            if PollVote.objects.filter(option__poll=poll, student=student).exists():
+                return Response({'success': False, 'error': 'Ви вже голосували в цьому опитуванні'}, status=400)
+
+        # Захист від подвійного голосу за цей варіант:
         if PollVote.objects.filter(option=option, student=student).exists():
             return Response({'success': False, 'error': 'Ви вже голосували за цей варіант'}, status=400)
 
