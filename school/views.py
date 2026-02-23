@@ -1027,7 +1027,7 @@ def groups_list(request):
                 'description': group.description,
                 'color': group.color,
                 'schedule': group.schedule,
-                'created_at': group.created_at,
+                'created_at': group.created_at.isoformat() if group.created_at else '',
                 'students': []
             }
         }, status=201)
@@ -1056,7 +1056,7 @@ def groups_list(request):
             'description': group.description,
             'color': group.color,
             'schedule': group.schedule,
-            'created_at': group.created_at,
+            'created_at': group.created_at.isoformat() if group.created_at else '',
             'students': students_data
         })
 
@@ -1089,7 +1089,7 @@ def group_detail(request, pk):
             'description': group.description,
             'color': group.color,
             'schedule': group.schedule,
-            'created_at': group.created_at,
+            'created_at': group.created_at.isoformat() if group.created_at else '',
             'students': students_data
         })
 
