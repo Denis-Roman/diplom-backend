@@ -1593,8 +1593,15 @@ def lessons_list(request):
     # GET - повертаємо всі уроки
     lessons = Lesson.objects.select_related('subject', 'group').all().order_by('-date', '-start_time')
     if role == 'student':
-        if getattr(request.user, 'group_id', None):
-            lessons = lessons.filter(group_id=request.user.group_id)
+        effective_group_id = getattr(request.user, 'group_id', None)
+        if not effective_group_id:
+            effective_group_id = (
+                GroupStudent.objects.filter(student_id=request.user.id)
+                .values_list('group_id', flat=True)
+                .first()
+            )
+        if effective_group_id:
+            lessons = lessons.filter(group_id=effective_group_id)
         else:
             lessons = lessons.none()
     result = []
@@ -1608,6 +1615,8 @@ def lessons_list(request):
             'start_time': lesson.start_time,
             'end_time': lesson.end_time,
             'meeting_link': lesson.meeting_link or '',
+            'is_online': True if (lesson.meeting_link or '').strip() else False,
+            'location': '',
             'status': lesson.status,
             'subject': None,
             'group': None,
@@ -1642,8 +1651,16 @@ def lesson_detail(request, pk):
     except Lesson.DoesNotExist:
         return Response({'success': False, 'error': 'Урок не знайдено'}, status=404)
 
-    if role == 'student' and getattr(request.user, 'group_id', None) != getattr(lesson, 'group_id', None):
-        return Response({'detail': 'Forbidden'}, status=403)
+    if role == 'student':
+        effective_group_id = getattr(request.user, 'group_id', None)
+        if not effective_group_id:
+            effective_group_id = (
+                GroupStudent.objects.filter(student_id=request.user.id)
+                .values_list('group_id', flat=True)
+                .first()
+            )
+        if effective_group_id != getattr(lesson, 'group_id', None):
+            return Response({'detail': 'Forbidden'}, status=403)
 
     if request.method == 'GET':
         return Response({
@@ -1654,6 +1671,8 @@ def lesson_detail(request, pk):
             'start_time': lesson.start_time,
             'end_time': lesson.end_time,
             'meeting_link': lesson.meeting_link or '',
+            'is_online': True if (lesson.meeting_link or '').strip() else False,
+            'location': '',
             'status': lesson.status,
             'subject': {
                 'id': lesson.subject.id,
@@ -2236,6 +2255,15 @@ def attendance_by_lesson(request, lesson_id=None):
         return Response({'success': False, 'error': 'Урок не знайдено'}, status=404)
 
     students = User.objects.filter(group=lesson.group, role='student')
+    if lesson.group_id:
+        legacy_student_ids = (
+            GroupStudent.objects.filter(group_id=lesson.group_id)
+            .values_list('student_id', flat=True)
+        )
+        students = User.objects.filter(
+            models.Q(id__in=legacy_student_ids) | models.Q(group=lesson.group),
+            role='student',
+        ).distinct()
     records = Attendance.objects.filter(lesson=lesson)
     attendance_dict = {a.user_id: a for a in records}
 
@@ -2260,7 +2288,7 @@ def attendance_by_lesson(request, lesson_id=None):
         'lesson': {
             'id': lesson.id,
             'title': lesson.title,
-            'date': lesson.date,
+            'date': lesson.date.isoformat() if lesson.date else '',
             'group': {
                 'id': lesson.group.id,
                 'name': lesson.group.name,
