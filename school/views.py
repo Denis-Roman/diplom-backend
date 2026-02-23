@@ -1755,8 +1755,16 @@ def task_detail(request, pk):
     except Task.DoesNotExist:
         return Response({'success': False, 'error': 'Завдання не знайдено'}, status=404)
 
-    if role == 'student' and getattr(request.user, 'group_id', None) != getattr(task, 'group_id', None):
-        return Response({'detail': 'Forbidden'}, status=403)
+    if role == 'student':
+        effective_group_id = getattr(request.user, 'group_id', None)
+        if not effective_group_id:
+            effective_group_id = (
+                GroupStudent.objects.filter(student_id=request.user.id)
+                .values_list('group_id', flat=True)
+                .first()
+            )
+        if effective_group_id != getattr(task, 'group_id', None):
+            return Response({'detail': 'Forbidden'}, status=403)
 
     if request.method == 'GET':
         return Response({
@@ -1887,7 +1895,22 @@ def tasks_list(request):
             tasks = tasks.none()
     result = []
 
+    submission_by_task_id = {}
+    if role == 'student':
+        try:
+            task_ids = list(tasks.values_list('id', flat=True))
+            subs = (
+                TaskSubmission.objects
+                .filter(student=request.user, task_id__in=task_ids)
+                .only('id', 'task_id', 'status', 'grade', 'teacher_comment', 'comment', 'submitted_at')
+            )
+            for s in subs:
+                submission_by_task_id[int(s.task_id)] = s
+        except Exception:
+            submission_by_task_id = {}
+
     for task in tasks:
+        submission = submission_by_task_id.get(int(task.id)) if role == 'student' else None
         task_data = {
             'id': task.id,
             'title': task.title,
@@ -1897,7 +1920,19 @@ def tasks_list(request):
             'max_grade': task.max_grade,
             'created_at': task.created_at.isoformat() if getattr(task, 'created_at', None) else '',
             'subject': None,
-            'group': None
+            'group': None,
+            'submission': (
+                {
+                    'id': submission.id,
+                    'status': submission.status,
+                    'grade': submission.grade,
+                    'comment': submission.comment,
+                    'teacher_comment': getattr(submission, 'teacher_comment', None),
+                    'submitted_at': submission.submitted_at.isoformat() if getattr(submission, 'submitted_at', None) else None,
+                }
+                if submission is not None
+                else None
+            ) if role == 'student' else None,
         }
 
         # Додаємо subject якщо є
@@ -1998,8 +2033,16 @@ def task_submissions(request, pk):
     except Task.DoesNotExist:
         return Response({'success': False, 'error': 'Завдання не знайдено'}, status=404)
 
-    if role == 'student' and getattr(request.user, 'group_id', None) != getattr(task, 'group_id', None):
-        return Response({'detail': 'Forbidden'}, status=403)
+    if role == 'student':
+        effective_group_id = getattr(request.user, 'group_id', None)
+        if not effective_group_id:
+            effective_group_id = (
+                GroupStudent.objects.filter(student_id=request.user.id)
+                .values_list('group_id', flat=True)
+                .first()
+            )
+        if effective_group_id != getattr(task, 'group_id', None):
+            return Response({'detail': 'Forbidden'}, status=403)
 
     if request.method == 'POST':
         if role != 'student':
