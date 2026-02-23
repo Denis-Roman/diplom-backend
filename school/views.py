@@ -38,6 +38,7 @@ from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from django.utils import timezone
+from django.utils.dateparse import parse_datetime
 from rest_framework.parsers import MultiPartParser, FormParser
 from rest_framework.parsers import MultiPartParser, FormParser
 from rest_framework.decorators import api_view, permission_classes, parser_classes
@@ -631,6 +632,44 @@ def auth_logout(request):
     return response
 
 
+def _parse_due_datetime(due_date_raw):
+    """Parse due_date from API.
+
+    Frontend often sends YYYY-MM-DD. If we store it as midnight in local TZ,
+    serializing to UTC becomes previous day (e.g. 22:00Z). To avoid this,
+    we store date-only values as local noon.
+    """
+
+    raw = str(due_date_raw or '').strip()
+    if not raw:
+        return None
+
+    # date-only
+    d = parse_date(raw)
+    if d and len(raw) == 10:
+        try:
+            local_tz = timezone.get_current_timezone()
+            naive = datetime.datetime(d.year, d.month, d.day, 12, 0, 0)
+            return timezone.make_aware(naive, local_tz)
+        except Exception:
+            return datetime.datetime(d.year, d.month, d.day, 12, 0, 0)
+
+    # full datetime
+    dt = parse_datetime(raw)
+    if not dt:
+        try:
+            dt = datetime.datetime.fromisoformat(raw.replace('Z', '+00:00'))
+        except Exception:
+            return None
+
+    if timezone.is_naive(dt):
+        try:
+            dt = timezone.make_aware(dt, timezone.get_current_timezone())
+        except Exception:
+            pass
+    return dt
+
+
 @api_view(['GET'])
 @permission_classes([AllowAny])
 def auth_me(request):
@@ -983,32 +1022,34 @@ def admin_recent_activity(request):
             return
         group_payload = None
         if group_obj is not None:
-            group_payload = {
-                'id': group_obj.id,
-                'name': group_obj.name,
-                'color': getattr(group_obj, 'color', None),
-            }
+            try:
+                group_payload = {
+                    'id': group_obj.id,
+                    'name': group_obj.name,
+                    'color': getattr(group_obj, 'color', None),
+                }
+            except Exception:
+                group_payload = None
+
+        try:
+            ts = timestamp
+            if isinstance(ts, datetime.datetime):
+                ts = timezone.localtime(ts).isoformat()
+            elif isinstance(ts, datetime.date):
+                ts = ts.isoformat()
+            else:
+                ts = str(ts)
+        except Exception:
+            ts = ''
 
         activities.append(
             {
                 'type': type_,
                 'action': action,
                 'name': name,
-                'timestamp': timestamp.isoformat() if hasattr(timestamp, 'isoformat') else str(timestamp),
+                'timestamp': ts,
                 'group': group_payload,
             }
-        )
-
-    students_qs = User.objects.filter(role='student').select_related('group').order_by('-created_at')
-    if group_id is not None:
-        students_qs = students_qs.filter(group_id=group_id)
-    for student in students_qs[:10]:
-        add_activity(
-            type_='student',
-            action='created',
-            name=student.name,
-            timestamp=student.created_at,
-            group_obj=student.group,
         )
 
     groups_qs = Group.objects.all().order_by('-created_at')
@@ -1756,20 +1797,16 @@ def tasks_list(request):
         if not title:
             return Response({'success': False, 'error': 'Назва завдання обов\'язкова'}, status=400)
 
-        due_date = request.data.get('due_date')
+        due_date = _parse_due_datetime(request.data.get('due_date'))
 
         # Валідація дати
         if due_date:
-            from datetime import datetime
             try:
-                due_date_obj = datetime.fromisoformat(due_date.replace('Z', '+00:00'))
-                today = datetime.now().date()
-                if due_date_obj.date() < today:
-                    return Response({
-                        'success': False,
-                        'error': 'Не можна вказувати дату раніше поточного дня'
-                    }, status=400)
-            except:
+                today = timezone.localdate()
+                due_d = timezone.localtime(due_date).date() if isinstance(due_date, datetime.datetime) else None
+                if due_d and due_d < today:
+                    return Response({'success': False, 'error': 'Не можна вказувати дату раніше поточного дня'}, status=400)
+            except Exception:
                 pass
 
         # Отримуємо group і subject
@@ -1876,7 +1913,7 @@ def tasks_bulk_create(request):
     title = request.data.get('title', '')
     description = request.data.get('description', '')
     task_type = request.data.get('type', 'homework')
-    due_date = request.data.get('due_date')
+    due_date = _parse_due_datetime(request.data.get('due_date'))
     max_grade = request.data.get('max_grade', 100)
     group_ids = request.data.get('group_ids', [])
     subject_id = request.data.get('subject_id')
@@ -1889,16 +1926,12 @@ def tasks_bulk_create(request):
 
     # Валідація дати
     if due_date:
-        from datetime import datetime, date
         try:
-            due_date_obj = datetime.fromisoformat(due_date.replace('Z', '+00:00'))
-            today = datetime.now().date()
-            if due_date_obj.date() < today:
-                return Response({
-                    'success': False,
-                    'error': 'Не можна вказувати дату раніше поточного дня'
-                }, status=400)
-        except:
+            today = timezone.localdate()
+            due_d = timezone.localtime(due_date).date() if isinstance(due_date, datetime.datetime) else None
+            if due_d and due_d < today:
+                return Response({'success': False, 'error': 'Не можна вказувати дату раніше поточного дня'}, status=400)
+        except Exception:
             pass
 
     created_tasks = []
