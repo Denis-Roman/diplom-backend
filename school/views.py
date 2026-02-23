@@ -2063,9 +2063,69 @@ def task_submissions(request, pk):
     )
 
 
-@api_view(['POST'])
+@api_view(['POST', 'PUT'])
+@permission_classes([IsAuthenticated])
 def grade_submission(request, pk):
-    return Response({'success': True})
+    forbidden = _require_roles(request, ('admin', 'superadmin'))
+    if forbidden:
+        return forbidden
+
+    try:
+        submission = TaskSubmission.objects.select_related('task', 'student').get(id=pk)
+    except TaskSubmission.DoesNotExist:
+        return Response({'success': False, 'error': 'Здачу не знайдено'}, status=404)
+
+    raw_grade = request.data.get('grade', None)
+    if raw_grade is None:
+        raw_grade = request.data.get('score', None)
+
+    if raw_grade is None or str(raw_grade).strip() == '':
+        return Response({'success': False, 'error': 'Вкажіть оцінку'}, status=400)
+
+    try:
+        grade_value = int(raw_grade)
+    except (TypeError, ValueError):
+        return Response({'success': False, 'error': 'Оцінка має бути числом'}, status=400)
+
+    max_grade = int(getattr(submission.task, 'max_grade', 100) or 100)
+    if grade_value < 0 or grade_value > max_grade:
+        return Response({'success': False, 'error': f'Оцінка має бути в межах 0-{max_grade}'}, status=400)
+
+    teacher_comment = request.data.get('teacher_comment', None)
+    if teacher_comment is None:
+        teacher_comment = request.data.get('comment', None)
+
+    submission.grade = grade_value
+    submission.teacher_comment = (str(teacher_comment).strip() if teacher_comment is not None else None) or None
+    submission.status = 'graded'
+    submission.graded_at = timezone.now()
+    submission.save(update_fields=['grade', 'teacher_comment', 'status', 'graded_at'])
+
+    try:
+        Notification.objects.create(
+            user=submission.student,
+            type='grade',
+            title='Оцінка за завдання',
+            message=f"{submission.task.title}: {grade_value}/{max_grade}" + (
+                f". {submission.teacher_comment}" if submission.teacher_comment else ''
+            ),
+            link='/dashboard/learning',
+        )
+    except Exception:
+        pass
+
+    return Response({
+        'success': True,
+        'submission': {
+            'id': submission.id,
+            'task_id': submission.task_id,
+            'student_id': submission.student_id,
+            'status': submission.status,
+            'grade': submission.grade,
+            'teacher_comment': submission.teacher_comment,
+            'graded_at': submission.graded_at.isoformat() if submission.graded_at else None,
+        }
+    })
 
 
 # ===== GRADES & ATTENDANCE =====
