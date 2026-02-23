@@ -1764,9 +1764,9 @@ def task_detail(request, pk):
             'title': task.title,
             'description': task.description,
             'type': task.type,
-            'due_date': task.due_date,
+            'due_date': task.due_date.isoformat() if getattr(task, 'due_date', None) else '',
             'status': task.status,
-            'created_at': task.created_at
+            'created_at': task.created_at.isoformat() if getattr(task, 'created_at', None) else ''
         })
 
     if request.method == 'DELETE':
@@ -1864,7 +1864,7 @@ def tasks_list(request):
                 'title': task.title,
                 'type': task.type,
                 'max_grade': task.max_grade,
-                'due_date': task.due_date,
+                'due_date': task.due_date.isoformat() if getattr(task, 'due_date', None) else '',
                 'group': {'id': group.id, 'name': group.name, 'color': group.color} if group else None,
                 'subject': {'id': subject.id, 'name': subject.name, 'short_name': subject.short_name,
                             'color': subject.color} if subject else None,
@@ -1893,9 +1893,9 @@ def tasks_list(request):
             'title': task.title,
             'type': task.type,
             'description': task.description,
-            'due_date': task.due_date,
+            'due_date': task.due_date.isoformat() if getattr(task, 'due_date', None) else '',
             'max_grade': task.max_grade,
-            'created_at': task.created_at,
+            'created_at': task.created_at.isoformat() if getattr(task, 'created_at', None) else '',
             'subject': None,
             'group': None
         }
