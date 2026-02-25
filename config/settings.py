@@ -2,6 +2,7 @@ import os
 from pathlib import Path
 
 from dotenv import load_dotenv
+from django.core.exceptions import ImproperlyConfigured
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -35,7 +36,7 @@ INSTALLED_APPS = [
     'rest_framework',
     'corsheaders',
     'rest_framework.authtoken',
-    'school',  # ← ДОДАЙТЕ ЦЕ!
+    'school',
 ]
 
 MIDDLEWARE = [
@@ -69,13 +70,23 @@ TEMPLATES = [
 
 WSGI_APPLICATION = 'config.wsgi.application'
 
-DB_ENGINE = os.getenv('DB_ENGINE', 'sqlite').lower()
+DB_ENGINE = os.getenv('DB_ENGINE', 'mssql').lower()
 
 if DB_ENGINE in ('mssql', 'sqlserver', 'azure'):
     DB_AUTH = os.getenv('DB_AUTH', 'sql').lower()
+    db_host = os.getenv('DB_HOST', '')
+    db_user = os.getenv('DB_USER', '')
+
+    # Azure SQL usually expects SQL user in the format: user@server
+    # If a plain username is provided, append server short name automatically.
+    if DB_AUTH not in ('aad', 'activedirectory', 'azuread', 'entra') and db_host.endswith('.database.windows.net'):
+        if db_user and '@' not in db_user:
+            server_short = db_host.split('.', 1)[0]
+            db_user = f'{db_user}@{server_short}'
+
     extra_params = os.getenv(
         'DB_EXTRA_PARAMS',
-        'Encrypt=yes;TrustServerCertificate=no;Connection Timeout=30;'
+        'Encrypt=yes;TrustServerCertificate=no;'
     )
 
     if DB_AUTH in ('aad', 'activedirectory', 'azuread', 'entra'):
@@ -85,9 +96,9 @@ if DB_ENGINE in ('mssql', 'sqlserver', 'azure'):
         'default': {
             'ENGINE': 'mssql',
             'NAME': os.getenv('DB_NAME', ''),
-            'USER': os.getenv('DB_USER', ''),
+            'USER': db_user,
             'PASSWORD': os.getenv('DB_PASSWORD', ''),
-            'HOST': os.getenv('DB_HOST', ''),
+            'HOST': db_host,
             'PORT': os.getenv('DB_PORT', '1433'),
             'OPTIONS': {
                 'driver': os.getenv('DB_DRIVER', 'ODBC Driver 18 for SQL Server'),
@@ -96,12 +107,10 @@ if DB_ENGINE in ('mssql', 'sqlserver', 'azure'):
         }
     }
 else:
-    DATABASES = {
-        'default': {
-            'ENGINE': 'django.db.backends.sqlite3',
-            'NAME': BASE_DIR / 'db.sqlite3',
-        }
-    }
+    raise ImproperlyConfigured(
+        "This project is configured to run only with MS SQL Server. "
+        "Set DB_ENGINE to 'mssql' (or 'sqlserver'/'azure')."
+    )
 
 AUTH_PASSWORD_VALIDATORS = []
 
