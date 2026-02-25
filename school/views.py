@@ -34,6 +34,8 @@ from school.models import (
     Team, TeamMember, Chat, ChatParticipant, ChatMessage, ChatMessageAttachment, Poll,
     PollOption, CourseMaterial, CourseTest, TestQuestion, QuestionOption, PollVote, Course, Puzzle, LearningMaterial,
     TaskSubmission, SubmissionFile, InvoicePaymentReceipt, LearningMaterialAttachment,
+    LearningMaterialGroup,
+    LearningMaterialFolder,
 )
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import AllowAny
@@ -81,7 +83,18 @@ def _effective_role(user) -> str | None:
         return None
     if getattr(user, 'is_superadmin', False):
         return 'superadmin'
-    return getattr(user, 'role', None)
+    raw_role = getattr(user, 'role', None)
+    if raw_role is None:
+        return None
+
+    role = str(raw_role).strip().lower()
+    if role in ('student', 'user', 'pupil'):
+        return 'student'
+    if role in ('admin',):
+        return 'admin'
+    if role in ('superadmin', 'super_admin', 'super-admin'):
+        return 'superadmin'
+    return role
 
 
 def _require_roles(request, roles: tuple[str, ...]):
@@ -602,53 +615,9 @@ def administrators_list(request):
 @api_view(['POST'])
 @permission_classes([AllowAny])
 def auth_register(request):
-    email = (request.data.get('email', '') or '').strip().lower()
-    password = request.data.get('password', '') or ''
-    name = (request.data.get('name', '') or '').strip()
-
-    if not email or not password:
-        return Response({'success': False, 'error': "Email та пароль обов'язкові"}, status=400)
-    if len(password) < 6:
-        return Response({'success': False, 'error': 'Пароль має бути не менше 6 символів'}, status=400)
-    if User.objects.filter(email=email).exists():
-        return Response({'success': False, 'error': 'Користувач з таким email вже існує'}, status=400)
-
-    # Use Django password hashing to stay compatible with check_password in auth_login.
-    user = User.objects.create(
-        email=email,
-        password=make_password(password),
-        name=name or email.split('@')[0],
-        role='student',
-        status='active',
-        is_active=True,
-        is_superadmin=False,
-    )
-
-    token = jwt.encode(
-        {
-            'userId': user.id,
-            'exp': timezone.now() + timedelta(days=7),
-        },
-        settings.JWT_SECRET,
-        algorithm='HS256',
-    )
-
-    return Response(
-        {
-            'success': True,
-            'token': token,
-            'user': {
-                'id': user.id,
-                'email': user.email,
-                'name': user.name,
-                'role': user.role,
-                'is_active': user.is_active,
-                'is_superadmin': user.is_superadmin,
-                'group_id': user.group_id,
-            },
-        },
-        status=201,
-    )
+    # Public self-registration is disabled.
+    # Students must be created by admins (or via approved SSO flows).
+    return Response({'detail': 'Not Found'}, status=404)
 
 
 @api_view(['POST'])
@@ -704,9 +673,18 @@ def auth_me(request):
     if not isinstance(user, User):
         return Response({'success': True, 'user': None}, status=200)
 
-    effective_role = user.role
-    if getattr(user, 'is_superadmin', False) and effective_role != 'superadmin':
-        effective_role = 'superadmin'
+    effective_role = _effective_role(user) or 'student'
+    effective_group_id = getattr(user, 'group_id', None)
+    if not effective_group_id:
+        try:
+            effective_group_id = (
+                GroupStudent.objects
+                .filter(student_id=user.id)
+                .values_list('group_id', flat=True)
+                .first()
+            )
+        except Exception:
+            effective_group_id = None
 
     return Response(
         {
@@ -718,7 +696,7 @@ def auth_me(request):
                 'role': effective_role,
                 'is_active': user.is_active,
                 'is_superadmin': user.is_superadmin,
-                'group_id': user.group_id,
+                'group_id': effective_group_id,
             },
         },
         status=200,
@@ -768,7 +746,27 @@ def auth_login(request):
         user = User.objects.get(email=email)
     except User.DoesNotExist:
         return Response({'success': False, 'error': 'Невірний email або пароль'}, status=401)
-    if not check_password(password, user.password):
+
+    password_ok = False
+    try:
+        password_ok = check_password(password, user.password)
+    except Exception:
+        password_ok = False
+
+    # Backward compatibility: some users (e.g. seeded superadmin) may have bcrypt hashes.
+    # If bcrypt matches, rehash into Django format for future logins.
+    if not password_ok:
+        try:
+            stored = str(user.password or '')
+            if stored.startswith(('$2a$', '$2b$', '$2y$')):
+                password_ok = bcrypt.checkpw(password.encode('utf-8'), stored.encode('utf-8'))
+                if password_ok:
+                    user.password = make_password(password)
+                    user.save(update_fields=['password'])
+        except Exception:
+            password_ok = False
+
+    if not password_ok:
         return Response({'success': False, 'error': 'Невірний email або пароль'}, status=401)
     token = jwt.encode(
         {
@@ -1180,7 +1178,9 @@ def students_list(request):
         }, status=201)
 
     # --- Ось тут має бути визначення students!
-    students = User.objects.select_related('group').filter(role='student')
+    students = User.objects.select_related('group').filter(
+        models.Q(role__iexact='student') | models.Q(role__iexact='user')
+    )
 
     # Map studentId -> group (fallback for legacy data where Users.group is null).
     memberships = (
@@ -1216,7 +1216,9 @@ def student_detail(request, pk):
     if forbidden:
         return forbidden
     try:
-        student = User.objects.get(id=pk, role='student')
+        student = User.objects.get(id=pk)
+        if _effective_role(student) != 'student':
+            raise User.DoesNotExist
     except User.DoesNotExist:
         return Response({'success': False, 'error': 'Студент не знайдений'}, status=404)
     if request.method == 'GET':
@@ -1300,13 +1302,20 @@ def group_add_students(request, pk):
     added_count = 0
     for student_id in student_ids:
         try:
-            student = User.objects.get(id=student_id, role='student')
+            student = User.objects.get(id=student_id)
+            if _effective_role(student) != 'student':
+                continue
+            created = False
             if not GroupStudent.objects.filter(group=group, student=student).exists():
                 GroupStudent.objects.create(group=group, student=student)
-                # Keep denormalized FK in sync for filters (tasks/schedule/grades).
-                if getattr(student, 'group_id', None) != group.id:
-                    student.group = group
-                    student.save(update_fields=['group'])
+                created = True
+
+            # Keep denormalized FK in sync even when membership already existed.
+            if getattr(student, 'group_id', None) != group.id:
+                student.group = group
+                student.save(update_fields=['group'])
+
+            if created:
                 added_count += 1
         except User.DoesNotExist:
             continue
@@ -1335,7 +1344,9 @@ def group_remove_student(request, pk):
         return Response({'success': False, 'error': 'Не вказано студента'}, status=400)
 
     try:
-        student = User.objects.get(id=student_id, role='student')
+        student = User.objects.get(id=student_id)
+        if _effective_role(student) != 'student':
+            return Response({'success': False, 'error': 'Студент не знайдений'}, status=404)
         GroupStudent.objects.filter(group=group, student=student).delete()
         if getattr(student, 'group_id', None) == group.id:
             student.group = None
@@ -1374,8 +1385,23 @@ def groups_list(request):
 
     groups = Group.objects.all()
     if role == 'student':
-        if getattr(request.user, 'group_id', None):
-            groups = groups.filter(id=request.user.group_id)
+        group_ids = []
+        try:
+            if getattr(request.user, 'group_id', None):
+                group_ids.append(int(request.user.group_id))
+        except Exception:
+            pass
+        try:
+            extra = list(
+                GroupStudent.objects.filter(student_id=request.user.id).values_list('group_id', flat=True)
+            )
+            group_ids.extend([int(x) for x in extra if x is not None])
+        except Exception:
+            pass
+
+        group_ids = list(dict.fromkeys(group_ids))
+        if group_ids:
+            groups = groups.filter(id__in=group_ids)
         else:
             groups = groups.none()
 
@@ -1412,8 +1438,23 @@ def group_detail(request, pk):
     except Group.DoesNotExist:
         return Response({'success': False, 'error': 'Група не знайдена'}, status=404)
 
-    if role == 'student' and getattr(request.user, 'group_id', None) != group.id:
-        return Response({'detail': 'Forbidden'}, status=403)
+    if role == 'student':
+        allowed_ids = []
+        try:
+            if getattr(request.user, 'group_id', None):
+                allowed_ids.append(int(request.user.group_id))
+        except Exception:
+            pass
+        try:
+            extra = list(
+                GroupStudent.objects.filter(student_id=request.user.id).values_list('group_id', flat=True)
+            )
+            allowed_ids.extend([int(x) for x in extra if x is not None])
+        except Exception:
+            pass
+        allowed_ids = list(dict.fromkeys(allowed_ids))
+        if group.id not in allowed_ids:
+            return Response({'detail': 'Forbidden'}, status=403)
 
     if request.method == 'GET':
         group_students = GroupStudent.objects.filter(group=group).select_related('student')
@@ -1934,15 +1975,25 @@ def tasks_list(request):
     # GET - повертаємо всі завдання з повною інформацією
     tasks = Task.objects.select_related('subject', 'group').all()
     if role == 'student':
-        effective_group_id = getattr(request.user, 'group_id', None)
-        if not effective_group_id:
-            effective_group_id = (
-                GroupStudent.objects.filter(student_id=request.user.id)
-                .values_list('group_id', flat=True)
-                .first()
+        group_ids = []
+        try:
+            if getattr(request.user, 'group_id', None):
+                group_ids.append(int(request.user.group_id))
+        except Exception:
+            pass
+
+        try:
+            extra_ids = list(
+                GroupStudent.objects.filter(student_id=request.user.id).values_list('group_id', flat=True)
             )
-        if effective_group_id:
-            tasks = tasks.filter(group_id=effective_group_id)
+            group_ids.extend([int(x) for x in extra_ids if x is not None])
+        except Exception:
+            pass
+
+        group_ids = list(dict.fromkeys(group_ids))
+
+        if group_ids:
+            tasks = tasks.filter(group_id__in=group_ids)
         else:
             tasks = tasks.none()
     result = []
@@ -2744,7 +2795,7 @@ def leaderboard(request):
     # Include students with 0 points so the leaderboard isn't empty on fresh DBs.
     students = (
         User.objects
-        .filter(role='student')
+        .filter(models.Q(role__iexact='student') | models.Q(role__iexact='user'))
         .annotate(total=Coalesce(Sum('points__points'), 0))
         .order_by('-total', 'id')[:10]
     )
@@ -2867,6 +2918,42 @@ def achievements_me(request):
         _ach(7, 'Командний гравець', 'Візьміть участь у груповому проекті', 1 if in_team else 0, 1, 20),
         _ach(8, 'Марафонець', 'Навчайтесь 30 днів поспіль', streak, 30, 60),
     ]
+
+    # Persist achievement rewards into StudentPoint so they affect balance/leaderboard.
+    # Idempotent: one record per achievement id.
+    try:
+        unlocked_ids = [int(a.get('id')) for a in payload if a.get('isUnlocked')]
+        if unlocked_ids:
+            existing = set(
+                StudentPoint.objects
+                .filter(student=student, source_type='achievement', source_id__in=unlocked_ids)
+                .values_list('source_id', flat=True)
+            )
+            to_create = []
+            for a in payload:
+                if not a.get('isUnlocked'):
+                    continue
+                aid = int(a.get('id'))
+                if aid in existing:
+                    continue
+                pts = int(a.get('points') or 0)
+                if pts <= 0:
+                    continue
+                title = str(a.get('title') or 'Achievement')
+                to_create.append(
+                    StudentPoint(
+                        student=student,
+                        points=pts,
+                        source_type='achievement',
+                        source_id=aid,
+                        description=f'Досягнення: {title}',
+                    )
+                )
+            if to_create:
+                StudentPoint.objects.bulk_create(to_create)
+    except Exception:
+        pass
+
     return Response(payload)
 
 
@@ -3335,20 +3422,65 @@ def polls_list(request):
             is_multiple_choice=is_multiple_choice,
             ends_at=ends_at
         )
-        # Окремо додаємо групи
-        if target_type == "group" and isinstance(group_ids, list):
-            gid = group_ids[0] if len(group_ids) > 0 else None
-            if gid is not None and str(gid).strip() != '':
+        # Store legacy single target_group (first), but notifications can be sent to multiple groups.
+        normalized_group_ids: list[int] = []
+        if isinstance(group_ids, list):
+            for gid in group_ids:
                 try:
-                    poll.target_group = Group.objects.get(id=int(gid))
-                    poll.save(update_fields=['target_group'])
+                    normalized_group_ids.append(int(gid))
                 except Exception:
-                    pass
+                    continue
+        elif group_ids is not None and str(group_ids).strip():
+            try:
+                normalized_group_ids = [int(group_ids)]
+            except Exception:
+                normalized_group_ids = []
+
+        if target_type == "group" and normalized_group_ids:
+            try:
+                poll.target_group = Group.objects.get(id=int(normalized_group_ids[0]))
+                poll.save(update_fields=['target_group'])
+            except Exception:
+                pass
 
         for o in options:
             text = (o.get('text') if isinstance(o, dict) else None) or ''
             if str(text).strip():
                 PollOption.objects.create(poll=poll, text=str(text).strip())
+
+        # Notifications to students
+        try:
+            student_ids: set[int] = set()
+
+            if target_type == 'all':
+                student_ids = set(User.objects.filter(role='student').values_list('id', flat=True))
+            elif target_type == 'group' and normalized_group_ids:
+                student_ids = set(
+                    User.objects.filter(role='student', group_id__in=normalized_group_ids)
+                    .values_list('id', flat=True)
+                )
+                extra_ids = set(
+                    GroupStudent.objects.filter(group_id__in=normalized_group_ids)
+                    .values_list('student_id', flat=True)
+                )
+                student_ids.update(extra_ids)
+
+            if student_ids:
+                link = f"/dashboard/notifications?pollId={poll.id}"
+                Notification.objects.bulk_create(
+                    [
+                        Notification(
+                            user_id=sid,
+                            type='poll',
+                            title=f"Опитування: {poll.title}",
+                            message=(poll.description or '')[:500],
+                            link=link,
+                        )
+                        for sid in student_ids
+                    ]
+                )
+        except Exception:
+            pass
 
         return Response({'success': True, 'pollId': poll.id})
 
@@ -3474,6 +3606,45 @@ def poll_detail(request, pk):
                 'text': option.text,
                 'votes': votes_count,
             })
+
+        if request.method == 'GET':
+            role = _effective_role(getattr(request, 'user', None))
+            if role == 'student':
+                # Allow access only for intended recipients.
+                can = False
+                if poll.target_type == 'all':
+                    can = True
+                else:
+                    try:
+                        student = request.user
+                        group_ids = []
+                        if getattr(student, 'group_id', None):
+                            group_ids.append(int(student.group_id))
+                        group_ids.extend(
+                            list(
+                                GroupStudent.objects.filter(student_id=student.id)
+                                .values_list('group_id', flat=True)
+                            )
+                        )
+                        if poll.target_group_id and int(poll.target_group_id) in [int(x) for x in group_ids if x is not None]:
+                            can = True
+                    except Exception:
+                        can = False
+
+                    # If poll was delivered via notification, allow it even when target_group is legacy/single.
+                    if not can:
+                        try:
+                            can = Notification.objects.filter(
+                                user=request.user,
+                                type='poll',
+                                link__contains=f"pollId={poll.id}",
+                            ).exists()
+                        except Exception:
+                            can = False
+
+                if not can:
+                    return Response({'detail': 'Forbidden'}, status=403)
+
         return Response({
             'id': poll.id,
             'title': poll.title,
@@ -4275,8 +4446,127 @@ def puzzle_answer(request, pk):
 
 @api_view(['GET', 'POST'])
 @permission_classes([IsAuthenticated])
+@parser_classes([MultiPartParser, FormParser])
 def learning_materials_list(request):
     role = _effective_role(getattr(request, 'user', None))
+
+    def _parse_bool(value, default=False):
+        if value is None:
+            return default
+        if isinstance(value, bool):
+            return value
+        s = str(value).strip().lower()
+        if s in ('1', 'true', 'yes', 'y', 'on'):
+            return True
+        if s in ('0', 'false', 'no', 'n', 'off', ''):
+            return False
+        return default
+
+    def _parse_int_list(raw):
+        if raw is None:
+            return []
+        if isinstance(raw, (list, tuple)):
+            items = list(raw)
+        else:
+            s = str(raw).strip()
+            if not s:
+                return []
+            try:
+                items = json.loads(s)
+            except Exception:
+                items = [part.strip() for part in s.split(',') if part.strip()]
+
+        result = []
+        for item in items:
+            try:
+                result.append(int(item))
+            except Exception:
+                continue
+        return list(dict.fromkeys(result))
+
+    def _student_group_ids(student: User) -> list[int]:
+        ids: list[int] = []
+        try:
+            if getattr(student, 'group_id', None):
+                ids.append(int(student.group_id))
+        except Exception:
+            pass
+        try:
+            extra = list(
+                GroupStudent.objects.filter(student_id=student.id).values_list('group_id', flat=True)
+            )
+            ids.extend([int(x) for x in extra if x is not None])
+        except Exception:
+            pass
+        return list(dict.fromkeys(ids))
+
+    def _material_payload(m: LearningMaterial):
+        groups_payload = []
+        try:
+            links = list(m.group_links.select_related('group').all())
+            for link in links:
+                if not link.group:
+                    continue
+                groups_payload.append(
+                    {
+                        'id': link.group.id,
+                        'name': link.group.name,
+                        'color': link.group.color,
+                        'is_published': bool(link.is_published),
+                    }
+                )
+        except Exception:
+            groups_payload = []
+
+        group_payload = None
+        if getattr(m, 'group', None):
+            group_payload = {
+                'id': m.group.id,
+                'name': m.group.name,
+                'color': m.group.color,
+            }
+
+        return {
+            'id': m.id,
+            'title': m.title,
+            'type': m.type,
+            'kind': getattr(m, 'kind', None) or 'video',
+            'content_text': getattr(m, 'content_text', None) or '',
+            'description': m.description,
+            'created_at': m.created_at.isoformat() if m.created_at else '',
+            'is_published': bool(m.is_published),
+            'folder': (
+                {
+                    'id': m.folder.id,
+                    'name': m.folder.name,
+                }
+                if getattr(m, 'folder', None)
+                else None
+            ),
+            'subject': (
+                {
+                    'id': m.subject.id,
+                    'name': m.subject.name,
+                    'short_name': m.subject.short_name,
+                    'color': m.subject.color,
+                }
+                if m.subject
+                else None
+            ),
+            'group': group_payload,
+            'groups': groups_payload,
+            'attachments': [
+                {
+                    'id': a.id,
+                    'type': a.type,
+                    'name': a.name,
+                    'url': a.url,
+                    'file_size': a.file_size,
+                }
+                for a in getattr(m, 'attachments', []).all()
+            ],
+        }
+
     if request.method == 'POST':
         if role not in ('admin', 'superadmin'):
             return Response({'detail': 'Forbidden'}, status=403)
@@ -4286,144 +4576,286 @@ def learning_materials_list(request):
 
         description = (request.data.get('description', '') or '').strip()
         material_type = (request.data.get('type', 'material') or 'material').strip()
-        is_published_raw = request.data.get('is_published', True)
-        is_published = bool(is_published_raw)
-        if isinstance(is_published_raw, str):
-            is_published = is_published_raw.lower() in ('true', '1', 'yes')
+        kind = (request.data.get('kind', '') or '').strip().lower() or 'video'
+        if kind not in ('video', 'document', 'article', 'book'):
+            return Response({'success': False, 'error': 'Некоректний тип матеріалу'}, status=400)
 
-        group = None
-        subject = None
-        group_id = request.data.get('group_id')
-        subject_id = request.data.get('subject_id')
-        if group_id:
+        group_ids = _parse_int_list(request.data.get('group_ids'))
+        if not group_ids:
+            # Backward compatibility (single group_id)
+            legacy_group_id = request.data.get('group_id')
             try:
-                group = Group.objects.get(id=int(group_id))
+                if legacy_group_id is not None and str(legacy_group_id).strip() != '':
+                    group_ids = [int(legacy_group_id)]
             except Exception:
-                group = None
-        if subject_id:
+                group_ids = []
+
+        if not group_ids:
+            return Response({'success': False, 'error': 'Оберіть хоча б одну групу'}, status=400)
+
+        subject = None
+        subject_id = request.data.get('subject_id')
+        if subject_id is not None and str(subject_id).strip() != '':
             try:
                 subject = Subject.objects.get(id=int(subject_id))
             except Exception:
                 subject = None
 
+        folder = None
+        folder_id = request.data.get('folder_id')
+        if folder_id is not None and str(folder_id).strip() != '':
+            try:
+                folder = LearningMaterialFolder.objects.get(id=int(folder_id))
+            except Exception:
+                folder = None
+
+        if folder is None:
+            return Response({'success': False, 'error': 'Оберіть папку'}, status=400)
+
+        is_published = _parse_bool(request.data.get('is_published', True), default=True)
+
+        content_text = (request.data.get('content_text', '') or '').strip()
+        video_url = (request.data.get('video_url', '') or '').strip()
+        link_url = (request.data.get('link_url', '') or '').strip()
+        file_obj = request.FILES.get('file')
+
+        if kind == 'article':
+            if not content_text:
+                return Response({'success': False, 'error': 'Текст статті обов\'язковий'}, status=400)
+        elif kind == 'video':
+            if not video_url:
+                return Response({'success': False, 'error': 'Посилання на відео обов\'язкове'}, status=400)
+        elif kind in ('document', 'book'):
+            if not file_obj and not link_url:
+                return Response({'success': False, 'error': 'Потрібен файл або посилання'}, status=400)
+
+        # Keep legacy FK for backwards compatibility (first group)
+        legacy_group = None
+        try:
+            legacy_group = Group.objects.get(id=int(group_ids[0]))
+        except Exception:
+            legacy_group = None
+
         material = LearningMaterial.objects.create(
             title=title,
             description=description,
             type=material_type,
-            group=group,
+            kind=kind,
+            content_text=content_text if kind == 'article' else None,
+            group=legacy_group,
+            folder=folder,
             subject=subject,
             is_published=is_published,
         )
 
-        attachments = request.data.get('attachments', [])
-        if isinstance(attachments, list):
-            for a in attachments:
-                if not isinstance(a, dict):
-                    continue
-                a_type = str(a.get('type') or '').strip() or 'file'
-                a_name = str(a.get('name') or '').strip() or 'attachment'
-                a_url = str(a.get('url') or '').strip() or None
-                a_size = a.get('file_size')
+        group_published_raw = request.data.get('group_published')
+        group_published = {}
+        if group_published_raw is not None:
+            try:
+                items = group_published_raw
+                if not isinstance(items, list):
+                    items = json.loads(str(group_published_raw))
+                if isinstance(items, list):
+                    for item in items:
+                        if not isinstance(item, dict):
+                            continue
+                        gid = item.get('group_id')
+                        try:
+                            gid_int = int(gid)
+                        except Exception:
+                            continue
+                        group_published[gid_int] = _parse_bool(item.get('is_published', True), default=True)
+            except Exception:
+                group_published = {}
+
+        links = []
+        for gid in group_ids:
+            links.append(
+                LearningMaterialGroup(
+                    material=material,
+                    group_id=gid,
+                    is_published=group_published.get(gid, True),
+                )
+            )
+        LearningMaterialGroup.objects.bulk_create(links, ignore_conflicts=True)
+
+        # Build attachment based on kind
+        if kind == 'video':
+            a_type = 'youtube' if ('youtube.com' in video_url or 'youtu.be' in video_url) else 'video'
+            LearningMaterialAttachment.objects.create(
+                material=material,
+                type=a_type,
+                name='Video',
+                url=video_url,
+                file_size=None,
+            )
+        elif kind in ('document', 'book'):
+            if file_obj:
+                safe_name = get_valid_filename(getattr(file_obj, 'name', 'file'))
+                stored_path = default_storage.save(f"materials/{material.id}/{safe_name}", file_obj)
+                url = default_storage.url(stored_path)
                 LearningMaterialAttachment.objects.create(
                     material=material,
-                    type=a_type,
-                    name=a_name,
-                    url=a_url,
-                    file_size=str(a_size) if a_size is not None else None,
+                    type='document' if kind == 'document' else 'file',
+                    name=safe_name,
+                    url=url,
+                    file_size=str(getattr(file_obj, 'size', '') or '') or None,
+                )
+            elif link_url:
+                LearningMaterialAttachment.objects.create(
+                    material=material,
+                    type='document' if kind == 'document' else 'file',
+                    name='Link',
+                    url=link_url,
+                    file_size=None,
                 )
 
-        return Response(
-            {
-                'success': True,
-                'material': {
-                    'id': material.id,
-                    'title': material.title,
-                },
-            },
-            status=201,
-        )
-
-    materials = LearningMaterial.objects.select_related('subject', 'group').prefetch_related('attachments').all()
-    if role == 'student':
-        effective_group_id = getattr(request.user, 'group_id', None)
-        if not effective_group_id:
-            effective_group_id = (
-                GroupStudent.objects.filter(student_id=request.user.id)
-                .values_list('group_id', flat=True)
-                .first()
+        # Create notifications for students in target groups
+        try:
+            student_ids = set(
+                User.objects.filter(role='student', group_id__in=group_ids).values_list('id', flat=True)
             )
-        materials = materials.filter(is_published=True)
-        if effective_group_id:
-            materials = materials.filter(models.Q(group_id__isnull=True) | models.Q(group_id=effective_group_id))
-        else:
-            materials = materials.filter(group_id__isnull=True)
+            extra_ids = set(
+                GroupStudent.objects.filter(group_id__in=group_ids).values_list('student_id', flat=True)
+            )
+            student_ids.update(extra_ids)
+            notifications = []
+            for sid in student_ids:
+                notifications.append(
+                    Notification(
+                        user_id=sid,
+                        type='material',
+                        title=f"Новий матеріал: {material.title}",
+                        message=(material.description or '')[:500],
+                        link=f"/dashboard/materials?materialId={material.id}",
+                    )
+                )
+            if notifications:
+                Notification.objects.bulk_create(notifications)
+        except Exception:
+            pass
 
-    payload = []
-    for m in materials.order_by('-created_at'):
-        payload.append(
-            {
-                'id': m.id,
-                'title': m.title,
-                'type': m.type,
-                'description': m.description,
-                'created_at': m.created_at.isoformat() if m.created_at else '',
-                'is_published': bool(m.is_published),
-                'subject': (
-                    {
-                        'id': m.subject.id,
-                        'name': m.subject.name,
-                        'short_name': m.subject.short_name,
-                        'color': m.subject.color,
-                    }
-                    if m.subject
-                    else None
-                ),
-                'group': (
-                    {
-                        'id': m.group.id,
-                        'name': m.group.name,
-                        'color': m.group.color,
-                    }
-                    if m.group
-                    else None
-                ),
-                'attachments': [
-                    {
-                        'id': a.id,
-                        'type': a.type,
-                        'name': a.name,
-                        'url': a.url,
-                        'file_size': a.file_size,
-                    }
-                    for a in getattr(m, 'attachments', []).all()
-                ],
-            }
-        )
+        return Response({'success': True, 'material': {'id': material.id, 'title': material.title}}, status=201)
+
+    materials = (
+        LearningMaterial.objects
+        .select_related('subject', 'group')
+        .select_related('folder')
+        .prefetch_related('attachments', 'group_links__group')
+        .all()
+    )
+
+    folder_filter = request.query_params.get('folder_id')
+    if folder_filter is not None and str(folder_filter).strip() != '':
+        try:
+            materials = materials.filter(folder_id=int(folder_filter))
+        except Exception:
+            pass
+
+    if role == 'student':
+        group_ids = _student_group_ids(request.user)
+        materials = materials.filter(is_published=True)
+        if group_ids:
+            materials = materials.filter(
+                (
+                    models.Q(group_links__group_id__in=group_ids, group_links__is_published=True)
+                    | models.Q(group_id__in=group_ids)
+                    | models.Q(group_links__isnull=True, group_id__isnull=True)
+                )
+            ).distinct()
+        else:
+            materials = materials.filter(group_links__isnull=True, group_id__isnull=True)
+
+    payload = [_material_payload(m) for m in materials.order_by('-created_at')]
     return Response(payload)
 
 
 @api_view(['GET', 'PUT', 'DELETE'])
 @permission_classes([IsAuthenticated])
+@parser_classes([MultiPartParser, FormParser])
 def learning_material_detail(request, pk):
     role = _effective_role(getattr(request, 'user', None))
     if role not in ('admin', 'superadmin', 'student'):
         return Response({'detail': 'Forbidden'}, status=403)
+
     try:
-        material = LearningMaterial.objects.get(id=pk)
+        material = (
+            LearningMaterial.objects
+            .select_related('subject', 'group', 'folder')
+            .prefetch_related('attachments', 'group_links', 'group_links__group')
+            .get(id=pk)
+        )
     except LearningMaterial.DoesNotExist:
         return Response({'success': False, 'error': 'Матеріал не знайдений'}, status=404)
 
-    if role == 'student' and not material.is_published:
+    def _student_group_ids(student: User) -> list[int]:
+        ids: list[int] = []
+        try:
+            if getattr(student, 'group_id', None):
+                ids.append(int(student.group_id))
+        except Exception:
+            pass
+        try:
+            extra = list(
+                GroupStudent.objects.filter(student_id=student.id).values_list('group_id', flat=True)
+            )
+            ids.extend([int(x) for x in extra if x is not None])
+        except Exception:
+            pass
+        return list(dict.fromkeys(ids))
+
+    def _student_can_access(m: LearningMaterial, student: User) -> bool:
+        if not bool(getattr(m, 'is_published', False)):
+            return False
+        gids = _student_group_ids(student)
+        # Global (no group bindings)
+        if (not getattr(m, 'group_id', None)) and (not m.group_links.exists()):
+            return True
+        # Legacy FK
+        if getattr(m, 'group_id', None) and gids and int(m.group_id) in gids:
+            return True
+        # Multi-group links
+        if gids and m.group_links.filter(group_id__in=gids, is_published=True).exists():
+            return True
+        return False
+
+    if role == 'student' and not _student_can_access(material, request.user):
         return Response({'detail': 'Forbidden'}, status=403)
     if request.method == 'GET':
+        groups_payload = []
+        try:
+            for link in material.group_links.select_related('group').all():
+                if not link.group:
+                    continue
+                groups_payload.append(
+                    {
+                        'id': link.group.id,
+                        'name': link.group.name,
+                        'color': link.group.color,
+                        'is_published': bool(link.is_published),
+                    }
+                )
+        except Exception:
+            groups_payload = []
+
         return Response(
             {
                 'id': material.id,
                 'title': material.title,
                 'description': material.description,
                 'type': material.type,
+                'kind': getattr(material, 'kind', None) or 'video',
+                'content_text': getattr(material, 'content_text', None) or '',
                 'created_at': material.created_at.isoformat() if material.created_at else '',
                 'is_published': bool(material.is_published),
+                'folder': (
+                    {
+                        'id': material.folder.id,
+                        'name': material.folder.name,
+                    }
+                    if getattr(material, 'folder', None)
+                    else None
+                ),
                 'subject': (
                     {
                         'id': material.subject.id,
@@ -4443,6 +4875,7 @@ def learning_material_detail(request, pk):
                     if material.group
                     else None
                 ),
+                'groups': groups_payload,
                 'attachments': [
                     {
                         'id': a.id,
@@ -4458,8 +4891,16 @@ def learning_material_detail(request, pk):
     if request.method == 'PUT':
         if role not in ('admin', 'superadmin'):
             return Response({'detail': 'Forbidden'}, status=403)
+        prev_kind = getattr(material, 'kind', None) or 'video'
+
         material.title = (request.data.get('title', material.title) or material.title).strip()
         material.description = request.data.get('description', material.description)
+
+        incoming_kind = request.data.get('kind', None)
+        if incoming_kind is not None:
+            k = (str(incoming_kind) or '').strip().lower()
+            if k and k in ('video', 'document', 'article', 'book'):
+                material.kind = k
 
         is_published_raw = request.data.get('is_published', material.is_published)
         if isinstance(is_published_raw, bool):
@@ -4486,31 +4927,317 @@ def learning_material_detail(request, pk):
                 except Exception:
                     pass
 
-        material.save()
+        folder_id = request.data.get('folder_id', None)
+        if folder_id is not None:
+            if str(folder_id).strip() == '':
+                return Response({'success': False, 'error': 'Папка обов\'язкова'}, status=400)
+            try:
+                material.folder = LearningMaterialFolder.objects.get(id=int(folder_id))
+            except Exception:
+                return Response({'success': False, 'error': 'Некоректна папка'}, status=400)
 
-        attachments = request.data.get('attachments', None)
-        if isinstance(attachments, list):
-            material.attachments.all().delete()
-            for a in attachments:
-                if not isinstance(a, dict):
-                    continue
-                a_type = str(a.get('type') or '').strip() or 'file'
-                a_name = str(a.get('name') or '').strip() or 'attachment'
-                a_url = str(a.get('url') or '').strip() or None
-                a_size = a.get('file_size')
+        # Groups (multi)
+        group_ids_raw = request.data.get('group_ids', None)
+        group_published_raw = request.data.get('group_published', None)
+        if group_ids_raw is not None:
+            def _parse_int_list(raw):
+                if raw is None:
+                    return []
+                if isinstance(raw, (list, tuple)):
+                    items = list(raw)
+                else:
+                    s = str(raw).strip()
+                    if not s:
+                        return []
+                    try:
+                        items = json.loads(s)
+                    except Exception:
+                        items = [part.strip() for part in s.split(',') if part.strip()]
+                result = []
+                for item in items:
+                    try:
+                        result.append(int(item))
+                    except Exception:
+                        continue
+                return list(dict.fromkeys(result))
+
+            group_ids = _parse_int_list(group_ids_raw)
+            if not group_ids:
+                return Response({'success': False, 'error': 'Оберіть хоча б одну групу'}, status=400)
+
+            published_map = {}
+            if group_published_raw is not None:
+                try:
+                    items = group_published_raw
+                    if not isinstance(items, list):
+                        items = json.loads(str(group_published_raw))
+                    if isinstance(items, list):
+                        for item in items:
+                            if not isinstance(item, dict):
+                                continue
+                            gid = item.get('group_id')
+                            try:
+                                gid_int = int(gid)
+                            except Exception:
+                                continue
+                            published_map[gid_int] = str(item.get('is_published', True)).strip().lower() in ('1', 'true', 'yes', 'y', 'on')
+                except Exception:
+                    published_map = {}
+
+            material.group_links.all().delete()
+            LearningMaterialGroup.objects.bulk_create(
+                [
+                    LearningMaterialGroup(
+                        material=material,
+                        group_id=gid,
+                        is_published=published_map.get(gid, True),
+                    )
+                    for gid in group_ids
+                ],
+                ignore_conflicts=True,
+            )
+
+            # legacy FK = first group
+            try:
+                material.group = Group.objects.get(id=int(group_ids[0]))
+            except Exception:
+                material.group = None
+
+        # Content validation / update
+        kind = getattr(material, 'kind', None) or 'video'
+        content_text = (request.data.get('content_text', None) or '').strip() if request.data.get('content_text', None) is not None else None
+        video_url = (request.data.get('video_url', None) or '').strip() if request.data.get('video_url', None) is not None else None
+        link_url = (request.data.get('link_url', None) or '').strip() if request.data.get('link_url', None) is not None else None
+        file_obj = request.FILES.get('file')
+
+        kind_changed = kind != prev_kind
+
+        if kind == 'article':
+            if content_text is None:
+                if kind_changed and not (getattr(material, 'content_text', None) or '').strip():
+                    return Response({'success': False, 'error': 'Текст статті обов\'язковий'}, status=400)
+            else:
+                if not content_text:
+                    return Response({'success': False, 'error': 'Текст статті обов\'язковий'}, status=400)
+                material.content_text = content_text
+        else:
+            # Non-article: clear article content if kind changed.
+            if kind_changed:
+                material.content_text = None
+
+        if kind == 'video':
+            if video_url is not None:
+                if not video_url:
+                    return Response({'success': False, 'error': 'Посилання на відео обов\'язкове'}, status=400)
+                material.attachments.all().delete()
+                a_type = 'youtube' if ('youtube.com' in video_url or 'youtu.be' in video_url) else 'video'
                 LearningMaterialAttachment.objects.create(
                     material=material,
                     type=a_type,
-                    name=a_name,
-                    url=a_url,
-                    file_size=str(a_size) if a_size is not None else None,
+                    name='Video',
+                    url=video_url,
+                    file_size=None,
                 )
+            elif kind_changed and material.attachments.count() == 0:
+                return Response({'success': False, 'error': 'Посилання на відео обов\'язкове'}, status=400)
 
+        if kind in ('document', 'book'):
+            if file_obj or (link_url is not None and link_url):
+                material.attachments.all().delete()
+                if file_obj:
+                    safe_name = get_valid_filename(getattr(file_obj, 'name', 'file'))
+                    stored_path = default_storage.save(f"materials/{material.id}/{safe_name}", file_obj)
+                    url = default_storage.url(stored_path)
+                    LearningMaterialAttachment.objects.create(
+                        material=material,
+                        type='document' if kind == 'document' else 'file',
+                        name=safe_name,
+                        url=url,
+                        file_size=str(getattr(file_obj, 'size', '') or '') or None,
+                    )
+                else:
+                    LearningMaterialAttachment.objects.create(
+                        material=material,
+                        type='document' if kind == 'document' else 'file',
+                        name='Link',
+                        url=link_url,
+                        file_size=None,
+                    )
+            elif kind_changed and material.attachments.count() == 0:
+                return Response({'success': False, 'error': 'Потрібен файл або посилання'}, status=400)
+
+        material.save()
         return Response({'success': True})
     if request.method == 'DELETE':
         if role not in ('admin', 'superadmin'):
             return Response({'detail': 'Forbidden'}, status=403)
         material.delete()
+        return Response({'success': True})
+
+
+@api_view(['GET', 'POST'])
+@permission_classes([IsAuthenticated])
+def learning_material_folders_list(request):
+    role = _effective_role(getattr(request, 'user', None))
+    if role not in ('admin', 'superadmin', 'student'):
+        return Response({'detail': 'Forbidden'}, status=403)
+
+    # Mutations are admin-only
+    if request.method == 'POST':
+        forbidden = _require_roles(request, ('admin', 'superadmin'))
+        if forbidden:
+            return forbidden
+
+        name = (request.data.get('name', '') or '').strip()
+        if not name:
+            return Response({'success': False, 'error': 'Назва папки обов\'язкова'}, status=400)
+        folder = LearningMaterialFolder.objects.create(name=name)
+        return Response({'success': True, 'folder': {'id': folder.id, 'name': folder.name}}, status=201)
+
+    # GET
+    folders = LearningMaterialFolder.objects.order_by('name', 'id').all()
+
+    if role == 'student':
+        def _student_group_ids(student: User) -> list[int]:
+            ids: list[int] = []
+            try:
+                if getattr(student, 'group_id', None):
+                    ids.append(int(student.group_id))
+            except Exception:
+                pass
+            try:
+                extra = list(
+                    GroupStudent.objects.filter(student_id=student.id).values_list('group_id', flat=True)
+                )
+                ids.extend([int(x) for x in extra if x is not None])
+            except Exception:
+                pass
+            return list(dict.fromkeys(ids))
+
+        group_ids = _student_group_ids(request.user)
+        access_q = models.Q(materials__is_published=True) & (
+            models.Q(materials__group_links__group_id__in=group_ids, materials__group_links__is_published=True)
+            | models.Q(materials__group_id__in=group_ids)
+            | models.Q(materials__group_links__isnull=True, materials__group_id__isnull=True)
+        )
+        folders = (
+            folders
+            .filter(access_q)
+            .annotate(materials_count=models.Count('materials', filter=access_q, distinct=True))
+            .distinct()
+        )
+
+        return Response(
+            [
+                {
+                    'id': f.id,
+                    'name': f.name,
+                    'materialsCount': int(getattr(f, 'materials_count', 0) or 0),
+                    'created_at': f.created_at.isoformat() if getattr(f, 'created_at', None) else '',
+                }
+                for f in folders
+            ]
+        )
+
+    # admin/superadmin
+    folders = folders.annotate(materials_count=models.Count('materials', distinct=True))
+    return Response(
+        [
+            {
+                'id': f.id,
+                'name': f.name,
+                'materialsCount': int(getattr(f, 'materials_count', 0) or 0),
+                'created_at': f.created_at.isoformat() if getattr(f, 'created_at', None) else '',
+            }
+            for f in folders
+        ]
+    )
+
+
+@api_view(['GET', 'PUT', 'DELETE'])
+@permission_classes([IsAuthenticated])
+def learning_material_folder_detail(request, pk):
+    role = _effective_role(getattr(request, 'user', None))
+    if role not in ('admin', 'superadmin', 'student'):
+        return Response({'detail': 'Forbidden'}, status=403)
+
+    if request.method in ('PUT', 'DELETE'):
+        forbidden = _require_roles(request, ('admin', 'superadmin'))
+        if forbidden:
+            return forbidden
+
+    try:
+        folder = LearningMaterialFolder.objects.get(id=pk)
+    except LearningMaterialFolder.DoesNotExist:
+        return Response({'success': False, 'error': 'Папку не знайдено'}, status=404)
+
+    if request.method == 'GET':
+        if role == 'student':
+            def _student_group_ids(student: User) -> list[int]:
+                ids: list[int] = []
+                try:
+                    if getattr(student, 'group_id', None):
+                        ids.append(int(student.group_id))
+                except Exception:
+                    pass
+                try:
+                    extra = list(
+                        GroupStudent.objects.filter(student_id=student.id).values_list('group_id', flat=True)
+                    )
+                    ids.extend([int(x) for x in extra if x is not None])
+                except Exception:
+                    pass
+                return list(dict.fromkeys(ids))
+
+            group_ids = _student_group_ids(request.user)
+            materials_qs = LearningMaterial.objects.filter(folder_id=folder.id, is_published=True)
+            if group_ids:
+                materials_qs = materials_qs.filter(
+                    (
+                        models.Q(group_links__group_id__in=group_ids, group_links__is_published=True)
+                        | models.Q(group_id__in=group_ids)
+                        | models.Q(group_links__isnull=True, group_id__isnull=True)
+                    )
+                ).distinct()
+            else:
+                materials_qs = materials_qs.filter(group_links__isnull=True, group_id__isnull=True)
+
+            count = int(materials_qs.count())
+            if count <= 0:
+                return Response({'success': False, 'error': 'Папку не знайдено'}, status=404)
+
+            return Response(
+                {
+                    'id': folder.id,
+                    'name': folder.name,
+                    'materialsCount': count,
+                    'created_at': folder.created_at.isoformat() if getattr(folder, 'created_at', None) else '',
+                }
+            )
+
+        return Response(
+            {
+                'id': folder.id,
+                'name': folder.name,
+                'materialsCount': folder.materials.count(),
+                'created_at': folder.created_at.isoformat() if getattr(folder, 'created_at', None) else '',
+            }
+        )
+
+    if request.method == 'PUT':
+        name = request.data.get('name', None)
+        if name is not None:
+            next_name = str(name).strip()
+            if not next_name:
+                return Response({'success': False, 'error': 'Назва папки обов\'язкова'}, status=400)
+            folder.name = next_name
+        folder.save()
+        return Response({'success': True})
+
+    if request.method == 'DELETE':
+        # Detach materials instead of deleting them.
+        LearningMaterial.objects.filter(folder=folder).update(folder=None)
+        folder.delete()
         return Response({'success': True})
 
 

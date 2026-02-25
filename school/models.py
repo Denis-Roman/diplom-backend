@@ -600,12 +600,39 @@ class Puzzle(models.Model):
         return self.title
 # ─── LEARNING MATERIALS ────────────────────────────────────
 
+class LearningMaterialFolder(models.Model):
+    name = models.CharField(max_length=255)
+    created_at = models.DateTimeField(auto_now_add=True, db_column='createdAt')
+
+    class Meta:
+        db_table = 'LearningMaterialFolders'
+
+    def __str__(self):
+        return self.name
+
 class LearningMaterial(models.Model):
     TYPE_CHOICES = [('homework', 'Homework'), ('material', 'Material'), ('test', 'Test')]
+
+    KIND_CHOICES = [
+        ('video', 'Video'),
+        ('document', 'Document'),
+        ('article', 'Article'),
+        ('book', 'Book'),
+    ]
 
     title = models.CharField(max_length=255)
     description = models.TextField(blank=True, null=True)
     type = models.CharField(max_length=20, choices=TYPE_CHOICES, default='material')
+    kind = models.CharField(max_length=20, choices=KIND_CHOICES, default='video')
+    content_text = models.TextField(blank=True, null=True, db_column='contentText')
+    folder = models.ForeignKey(
+        'LearningMaterialFolder',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        db_column='folderId',
+        related_name='materials',
+    )
     subject = models.ForeignKey(Subject, on_delete=models.SET_NULL, null=True, blank=True, db_column='subjectId')
     group = models.ForeignKey(Group, on_delete=models.SET_NULL, null=True, blank=True, db_column='groupId')
     is_published = models.BooleanField(default=True, db_column='isPublished')
@@ -632,3 +659,24 @@ class LearningMaterialAttachment(models.Model):
 
     class Meta:
         db_table = 'LearningMaterialAttachments'
+
+
+class LearningMaterialGroup(models.Model):
+    material = models.ForeignKey(
+        LearningMaterial,
+        on_delete=models.CASCADE,
+        db_column='materialId',
+        related_name='group_links',
+    )
+    group = models.ForeignKey(
+        Group,
+        on_delete=models.CASCADE,
+        db_column='groupId',
+        related_name='material_links',
+    )
+    is_published = models.BooleanField(default=True, db_column='isPublished')
+    created_at = models.DateTimeField(auto_now_add=True, db_column='createdAt')
+
+    class Meta:
+        db_table = 'LearningMaterialGroups'
+        unique_together = ('material', 'group')

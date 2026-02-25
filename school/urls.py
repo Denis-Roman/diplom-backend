@@ -119,6 +119,10 @@ urlpatterns = [
     path('materials/', views.learning_materials_list, name='learning-materials-list'),
     path('materials/<int:pk>/', views.learning_material_detail, name='learning-material-detail'),
 
+    # Learning Material Folders
+    path('material-folders/', views.learning_material_folders_list, name='learning-material-folders-list'),
+    path('material-folders/<int:pk>/', views.learning_material_folder_detail, name='learning-material-folder-detail'),
+
     # Notifications
     path('notifications/', views.notifications_list, name='notifications-list'),
     path('notifications/<int:pk>/read/', views.notification_read, name='notification-read'),
