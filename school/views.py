@@ -4549,7 +4549,7 @@ def puzzles_list(request):
             }
         }, status=201)
 
-    # GET - для студентів не показуємо вже розв'язані загадки
+    # GET - повертаємо всі активні загадки; для студентів додаємо прапорець розв'язання
     puzzles = Puzzle.objects.filter(is_active=True)
     if role == 'student':
         solved_subquery = StudentPoint.objects.filter(
@@ -4560,7 +4560,9 @@ def puzzles_list(request):
             models.Q(source_type__icontains='puzz') |
             models.Q(description__istartswith='Загадка:')
         )
-        puzzles = puzzles.annotate(_is_solved=models.Exists(solved_subquery)).filter(_is_solved=False)
+        puzzles = puzzles.annotate(_is_solved=models.Exists(solved_subquery))
+    else:
+        puzzles = puzzles.annotate(_is_solved=models.Value(False, output_field=models.BooleanField()))
     return Response([{
         'id': p.id,
         'title': p.title,
@@ -4570,6 +4572,7 @@ def puzzles_list(request):
         'difficulty': p.difficulty,
         'points': p.points,
         'solved_by': p.solved_by,
+        'is_solved': bool(getattr(p, '_is_solved', False)),
         'created_at': p.created_at.isoformat() if p.created_at else ''
     } for p in puzzles])
 
