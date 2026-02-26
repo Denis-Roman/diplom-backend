@@ -4343,11 +4343,15 @@ def puzzles_list(request):
     # GET - для студентів не показуємо вже розв'язані загадки
     puzzles = Puzzle.objects.filter(is_active=True)
     if role == 'student':
-        solved_ids = StudentPoint.objects.filter(
+        solved_subquery = StudentPoint.objects.filter(
             student=request.user,
-            source_type='puzzle',
-        ).values_list('source_id', flat=True)
-        puzzles = puzzles.exclude(id__in=solved_ids)
+            source_id=models.OuterRef('id'),
+        ).filter(
+            models.Q(source_type__iexact='puzzle') |
+            models.Q(source_type__icontains='puzz') |
+            models.Q(description__istartswith='Загадка:')
+        )
+        puzzles = puzzles.annotate(_is_solved=models.Exists(solved_subquery)).filter(_is_solved=False)
     return Response([{
         'id': p.id,
         'title': p.title,
