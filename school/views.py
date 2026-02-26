@@ -2958,7 +2958,7 @@ def invoices_list(request):
                 {
                     'id': latest_receipt.id,
                     'amount': float(latest_receipt.amount),
-                    'receiptUrl': latest_receipt.receipt_url,
+                    'receiptUrl': _absolute_file_url(request, latest_receipt.receipt_url),
                     'receiptName': latest_receipt.receipt_name,
                     'status': latest_receipt.status,
                     'note': latest_receipt.note or '',
@@ -3563,7 +3563,7 @@ def chat_messages(request, pk):
                     'id': a.id,
                     'type': a.type,
                     'name': a.name,
-                    'url': a.url,
+                    'url': _absolute_file_url(request, a.url),
                     'size': a.size,
                 }
                 for a in m.attachments.all()
@@ -4800,7 +4800,7 @@ def learning_materials_list(request):
                     'id': a.id,
                     'type': a.type,
                     'name': a.name,
-                    'url': a.url,
+                    'url': _absolute_file_url(request, a.url),
                     'file_size': a.file_size,
                 }
                 for a in getattr(m, 'attachments', []).all()
@@ -5121,7 +5121,7 @@ def learning_material_detail(request, pk):
                         'id': a.id,
                         'type': a.type,
                         'name': a.name,
-                        'url': a.url,
+                        'url': _absolute_file_url(request, a.url),
                         'file_size': a.file_size,
                     }
                     for a in material.attachments.all()
