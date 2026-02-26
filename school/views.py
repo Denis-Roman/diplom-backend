@@ -520,7 +520,10 @@ def invoice_submit_receipt(request, pk):
         return Response({'detail': 'Forbidden'}, status=403)
 
     receipt_file = request.FILES.get('receipt')
-    if not receipt_file:
+    monobank_invoice_id = str(request.data.get('monobank_invoice_id') or '').strip()
+    is_monobank = bool(monobank_invoice_id)
+
+    if not receipt_file and not is_monobank:
         return Response({'success': False, 'error': 'Додайте квитанцію'}, status=400)
 
     try:
@@ -536,11 +539,32 @@ def invoice_submit_receipt(request, pk):
     if amount > remaining:
         return Response({'success': False, 'error': 'Сума більша за залишок до сплати'}, status=400)
 
-    safe_name = get_valid_filename(receipt_file.name)
-    path = default_storage.save(f'invoice_receipts/{invoice.id}/{safe_name}', receipt_file)
-    url = default_storage.url(path)
+    # Deduplicate Monobank receipt creation on page refresh/retries.
+    if is_monobank:
+        marker = f"monobank_invoice_id={monobank_invoice_id}"
+        existing = (
+            InvoicePaymentReceipt.objects
+            .filter(invoice=invoice, student=request.user)
+            .filter(note__icontains=marker)
+            .order_by('-id')
+            .first()
+        )
+        if existing:
+            return Response({'success': True, 'receipt': {'id': existing.id}, 'duplicate': True}, status=200)
+
+    if receipt_file:
+        safe_name = get_valid_filename(receipt_file.name)
+        path = default_storage.save(f'invoice_receipts/{invoice.id}/{safe_name}', receipt_file)
+        url = default_storage.url(path)
+    else:
+        safe_name = str(request.data.get('receipt_name') or f"monobank-{monobank_invoice_id}.txt")
+        url = str(request.data.get('receipt_url') or 'https://send.monobank.ua/')
 
     note = (request.data.get('note') or '').strip() or None
+    if is_monobank:
+        marker = f"monobank_invoice_id={monobank_invoice_id}"
+        note = f"{note}\n{marker}" if note else marker
+
     rec = InvoicePaymentReceipt.objects.create(
         invoice=invoice,
         student=request.user,
@@ -557,6 +581,23 @@ def invoice_submit_receipt(request, pk):
         title='Квитанцію надіслано',
         message='Квитанція надіслана на перевірку.',
     )
+
+    # Notify active admins/superadmins for manual confirmation, same workflow as bank transfer.
+    admin_candidates = User.objects.filter(
+        models.Q(role='admin') | models.Q(role='superadmin') | models.Q(is_superadmin=True),
+        is_active=True,
+    ).exclude(id=request.user.id)
+    for admin_user in admin_candidates:
+        try:
+            Notification.objects.create(
+                user=admin_user,
+                type='invoice_receipt',
+                title='Нова квитанція на перевірку',
+                message=f"{request.user.name} надіслав(ла) квитанцію за рахунком #{invoice.id}.",
+                link='/admin/billing',
+            )
+        except Exception:
+            pass
 
     return Response({'success': True, 'receipt': {'id': rec.id}}, status=201)
 
