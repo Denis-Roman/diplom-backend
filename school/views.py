@@ -3657,6 +3657,14 @@ def poll_detail(request, pk):
                 if not can:
                     return Response({'detail': 'Forbidden'}, status=403)
 
+        has_voted = False
+        try:
+            current_user = getattr(request, 'user', None)
+            if current_user and getattr(current_user, 'id', None):
+                has_voted = PollVote.objects.filter(option__poll=poll, student_id=current_user.id).exists()
+        except Exception:
+            has_voted = False
+
         return Response({
             'id': poll.id,
             'title': poll.title,
@@ -3668,6 +3676,7 @@ def poll_detail(request, pk):
             'targetGroupName': poll.target_group.name if poll.target_group else "Всі учні",
             'status': poll.status,
             'options': options_data,
+            'hasVoted': bool(has_voted),
             'endsAt': poll.ends_at.isoformat(),
             'createdAt': poll.created_at.isoformat() if poll.created_at else '',
         })
