@@ -5380,10 +5380,21 @@ def users_list(request):
         if requested_role:
             users = users.filter(role=requested_role)
     else:
-        # Student: allow listing admins for chat (minimal fields)
-        if requested_role and requested_role != 'admin':
+        # Student: allow listing users for private chats (students + admins, minimal fields)
+        allowed_roles = {'student', 'admin', 'superadmin', 'user', 'pupil'}
+        if requested_role and requested_role not in allowed_roles:
             return Response({'detail': 'Forbidden'}, status=403)
-        users = User.objects.filter(role__in=['admin', 'superadmin']).all()
+
+        users = User.objects.filter(
+            models.Q(role__iexact='student') |
+            models.Q(role__iexact='user') |
+            models.Q(role__iexact='pupil') |
+            models.Q(role__iexact='admin') |
+            models.Q(role__iexact='superadmin')
+        ).filter(is_active=True)
+
+        if requested_role:
+            users = users.filter(role__iexact=requested_role)
 
     result = []
 
