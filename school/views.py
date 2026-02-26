@@ -115,6 +115,17 @@ def _can_access_user(viewer: User, target: User) -> bool:
     return viewer.id == target.id
 
 
+def _absolute_file_url(request, url: str | None) -> str:
+    raw = str(url or '').strip()
+    if not raw:
+        return ''
+    if raw.startswith('http://') or raw.startswith('https://'):
+        return raw
+    if raw.startswith('/'):
+        return request.build_absolute_uri(raw)
+    return request.build_absolute_uri(f'/{raw}')
+
+
 def _can_admin_manage_task(user: User, task: Task) -> bool:
     role = _effective_role(user)
     if role == 'superadmin':
@@ -2122,6 +2133,7 @@ def tasks_list(request):
             subs = (
                 TaskSubmission.objects
                 .filter(student=request.user, task_id__in=task_ids)
+                .prefetch_related('files')
                 .only('id', 'task_id', 'status', 'grade', 'teacher_comment', 'comment', 'submitted_at')
             )
             for s in subs:
@@ -2150,6 +2162,16 @@ def tasks_list(request):
                     'comment': submission.comment,
                     'teacher_comment': getattr(submission, 'teacher_comment', None),
                     'submitted_at': submission.submitted_at.isoformat() if getattr(submission, 'submitted_at', None) else None,
+                    'files': [
+                        {
+                            'id': f.id,
+                            'name': f.file_name,
+                            'url': _absolute_file_url(request, getattr(f, 'file_url', '')),
+                            'size': f.file_size,
+                            'type': f.file_type,
+                        }
+                        for f in submission.files.all()
+                    ] if hasattr(submission, 'files') else [],
                 }
                 if submission is not None
                 else None
@@ -2280,36 +2302,33 @@ def task_submissions(request, pk):
     elif role not in ('admin', 'superadmin'):
         return Response({'detail': 'Forbidden'}, status=403)
 
-    def _absolute_file_url(url: str | None) -> str:
-        raw = str(url or '').strip()
-        if not raw:
-            return ''
-        if raw.startswith('http://') or raw.startswith('https://'):
-            return raw
-        if raw.startswith('/'):
-            return request.build_absolute_uri(raw)
-        return request.build_absolute_uri(f'/{raw}')
-
     if request.method == 'POST':
         if role != 'student':
             return Response({'detail': 'Forbidden'}, status=403)
 
         comment = str(request.data.get('comment', '') or '').strip() or None
-        submission, _created = TaskSubmission.objects.get_or_create(
-            task=task,
-            student=request.user,
-            defaults={'status': 'submitted', 'comment': comment, 'submitted_at': timezone.now()},
-        )
-        submission.comment = comment
-        submission.status = 'submitted'
-        submission.submitted_at = timezone.now()
-        submission.save(update_fields=['comment', 'status', 'submitted_at'])
-
         files = []
         try:
             files = request.FILES.getlist('files')
         except Exception:
             files = []
+
+        if not comment and not files:
+            return Response({'success': False, 'error': 'Додайте файл або коментар'}, status=400)
+
+        submission, _created = TaskSubmission.objects.get_or_create(
+            task=task,
+            student=request.user,
+            defaults={'status': 'submitted', 'comment': comment, 'submitted_at': timezone.now()},
+        )
+
+        if submission.status == 'graded':
+            return Response({'success': False, 'error': 'Це завдання вже оцінене і не може бути перездане'}, status=400)
+
+        submission.comment = comment
+        submission.status = 'submitted'
+        submission.submitted_at = timezone.now()
+        submission.save(update_fields=['comment', 'status', 'submitted_at'])
 
         saved_files = []
         for f in files:
@@ -2326,7 +2345,7 @@ def task_submissions(request, pk):
             saved_files.append({'id': file_rec.id, 'name': file_rec.file_name, 'url': file_rec.file_url, 'size': file_rec.file_size})
 
         for item in saved_files:
-            item['url'] = _absolute_file_url(item.get('url'))
+            item['url'] = _absolute_file_url(request, item.get('url'))
 
         if getattr(task, 'assigned_admin_id', None):
             try:
@@ -2359,7 +2378,7 @@ def task_submissions(request, pk):
                 'teacher_comment': getattr(s, 'teacher_comment', None) or None,
                 'submitted_at': s.submitted_at.isoformat() if getattr(s, 'submitted_at', None) else None,
                 'files': [
-                    {'id': f.id, 'name': f.file_name, 'url': _absolute_file_url(f.file_url), 'size': f.file_size, 'type': f.file_type}
+                    {'id': f.id, 'name': f.file_name, 'url': _absolute_file_url(request, f.file_url), 'size': f.file_size, 'type': f.file_type}
                     for f in s.files.all()
                 ],
             }
@@ -2383,7 +2402,7 @@ def task_submissions(request, pk):
                     {
                         'id': f.id,
                         'name': f.file_name,
-                        'url': _absolute_file_url(f.file_url),
+                        'url': _absolute_file_url(request, f.file_url),
                         'size': f.file_size,
                         'type': f.file_type,
                     }
