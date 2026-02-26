@@ -540,7 +540,10 @@ def invoice_receipt_review(request, pk, receipt_id):
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
 def invoices_list(request):
+    role = _effective_role(getattr(request, 'user', None))
     invoices = Invoice.objects.select_related('student').order_by('-created_at').all()
+    if role == 'student':
+        invoices = invoices.filter(student=request.user)
     data = []
     for i in invoices:
         data.append({
@@ -2137,14 +2140,23 @@ def task_submissions(request, pk):
         return Response({'success': False, 'error': 'Завдання не знайдено'}, status=404)
 
     if role == 'student':
-        effective_group_id = getattr(request.user, 'group_id', None)
-        if not effective_group_id:
-            effective_group_id = (
-                GroupStudent.objects.filter(student_id=request.user.id)
-                .values_list('group_id', flat=True)
-                .first()
+        group_ids = []
+        try:
+            if getattr(request.user, 'group_id', None):
+                group_ids.append(int(request.user.group_id))
+        except Exception:
+            pass
+
+        try:
+            extra_ids = list(
+                GroupStudent.objects.filter(student_id=request.user.id).values_list('group_id', flat=True)
             )
-        if effective_group_id != getattr(task, 'group_id', None):
+            group_ids.extend([int(x) for x in extra_ids if x is not None])
+        except Exception:
+            pass
+
+        group_ids = list(dict.fromkeys(group_ids))
+        if not group_ids or int(getattr(task, 'group_id', 0) or 0) not in group_ids:
             return Response({'detail': 'Forbidden'}, status=403)
 
     if request.method == 'POST':
@@ -4319,8 +4331,14 @@ def puzzles_list(request):
             }
         }, status=201)
 
-    # GET - повертаємо всі активні загадки
+    # GET - для студентів не показуємо вже розв'язані загадки
     puzzles = Puzzle.objects.filter(is_active=True)
+    if role == 'student':
+        solved_ids = StudentPoint.objects.filter(
+            student=request.user,
+            source_type='puzzle',
+        ).values_list('source_id', flat=True)
+        puzzles = puzzles.exclude(id__in=solved_ids)
     return Response([{
         'id': p.id,
         'title': p.title,
