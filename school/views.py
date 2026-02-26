@@ -2280,6 +2280,16 @@ def task_submissions(request, pk):
     elif role not in ('admin', 'superadmin'):
         return Response({'detail': 'Forbidden'}, status=403)
 
+    def _absolute_file_url(url: str | None) -> str:
+        raw = str(url or '').strip()
+        if not raw:
+            return ''
+        if raw.startswith('http://') or raw.startswith('https://'):
+            return raw
+        if raw.startswith('/'):
+            return request.build_absolute_uri(raw)
+        return request.build_absolute_uri(f'/{raw}')
+
     if request.method == 'POST':
         if role != 'student':
             return Response({'detail': 'Forbidden'}, status=403)
@@ -2315,6 +2325,9 @@ def task_submissions(request, pk):
             )
             saved_files.append({'id': file_rec.id, 'name': file_rec.file_name, 'url': file_rec.file_url, 'size': file_rec.file_size})
 
+        for item in saved_files:
+            item['url'] = _absolute_file_url(item.get('url'))
+
         if getattr(task, 'assigned_admin_id', None):
             try:
                 Notification.objects.create(
@@ -2346,7 +2359,7 @@ def task_submissions(request, pk):
                 'teacher_comment': getattr(s, 'teacher_comment', None) or None,
                 'submitted_at': s.submitted_at.isoformat() if getattr(s, 'submitted_at', None) else None,
                 'files': [
-                    {'id': f.id, 'name': f.file_name, 'url': f.file_url, 'size': f.file_size, 'type': f.file_type}
+                    {'id': f.id, 'name': f.file_name, 'url': _absolute_file_url(f.file_url), 'size': f.file_size, 'type': f.file_type}
                     for f in s.files.all()
                 ],
             }
@@ -2370,7 +2383,7 @@ def task_submissions(request, pk):
                     {
                         'id': f.id,
                         'name': f.file_name,
-                        'url': f.file_url,
+                        'url': _absolute_file_url(f.file_url),
                         'size': f.file_size,
                         'type': f.file_type,
                     }
