@@ -149,6 +149,14 @@ class Task(models.Model):
     type = models.CharField(max_length=20, choices=TYPE_CHOICES, default='homework')
     due_date = models.DateTimeField(null=True, blank=True, db_column='dueDate')
     max_grade = models.IntegerField(default=100, db_column='maxGrade')
+    assigned_admin = models.ForeignKey(
+        'User',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        db_column='assignedAdminId',
+        related_name='assigned_tasks',
+    )
     created_at = models.DateTimeField(auto_now_add=True, db_column='createdAt')
 
     class Meta:

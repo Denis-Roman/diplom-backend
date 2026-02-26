@@ -114,6 +114,69 @@ def _can_access_user(viewer: User, target: User) -> bool:
         return True
     return viewer.id == target.id
 
+
+def _can_admin_manage_task(user: User, task: Task) -> bool:
+    role = _effective_role(user)
+    if role == 'superadmin':
+        return True
+    if role != 'admin':
+        return False
+    return getattr(task, 'assigned_admin_id', None) in (None, user.id)
+
+
+def _scope_tasks_for_role(user: User, queryset):
+    role = _effective_role(user)
+    if role == 'superadmin':
+        return queryset
+    if role == 'admin':
+        return queryset.filter(models.Q(assigned_admin_id=user.id) | models.Q(assigned_admin_id__isnull=True))
+    return queryset.none()
+
+
+def _parse_admin_target(value):
+    if value in (None, '', 'null'):
+        return None
+    try:
+        admin_id = int(value)
+    except (TypeError, ValueError):
+        return None
+    return User.objects.filter(id=admin_id, role='admin').first()
+
+
+def _redistribute_admin_tasks(source_admin: User, target_admin: User | None = None) -> int:
+    tasks = list(Task.objects.filter(assigned_admin_id=source_admin.id).order_by('id'))
+    if not tasks:
+        return 0
+
+    if target_admin and target_admin.id != source_admin.id:
+        Task.objects.filter(id__in=[t.id for t in tasks]).update(assigned_admin=target_admin)
+        return len(tasks)
+
+    candidates = list(
+        User.objects.filter(role='admin', is_active=True)
+        .exclude(id=source_admin.id)
+        .order_by('id')
+    )
+    if not candidates:
+        Task.objects.filter(id__in=[t.id for t in tasks]).update(assigned_admin=None)
+        return len(tasks)
+
+    load = {
+        admin.id: int(
+            Task.objects.filter(assigned_admin_id=admin.id).count()
+        )
+        for admin in candidates
+    }
+
+    changed = 0
+    for task in tasks:
+        target = min(candidates, key=lambda admin: load.get(admin.id, 0))
+        task.assigned_admin = target
+        task.save(update_fields=['assigned_admin'])
+        load[target.id] = load.get(target.id, 0) + 1
+        changed += 1
+    return changed
+
 @api_view(['GET', 'PUT', 'DELETE'])
 @permission_classes([IsAuthenticated])
 def administrator_detail(request, pk):
@@ -155,6 +218,18 @@ def administrator_detail(request, pk):
     if request.method == 'DELETE':
         if admin.is_superadmin:
             return Response({'error': "Неможливо видалити супер-адміна."}, status=403)
+
+        reassign_to = (
+            request.data.get('reassign_to_admin_id')
+            if hasattr(request, 'data') else None
+        ) or request.query_params.get('reassign_to_admin_id')
+        target_admin = _parse_admin_target(reassign_to)
+        if reassign_to not in (None, '', 'null') and not target_admin:
+            return Response({'error': 'Цільового адміністратора не знайдено'}, status=400)
+        if target_admin and target_admin.id == admin.id:
+            return Response({'error': 'Неможливо призначити завдання тому ж адміну'}, status=400)
+
+        _redistribute_admin_tasks(admin, target_admin)
         admin.delete()
         return Response({'success': True})
 
@@ -732,6 +807,18 @@ def admin_delete(request, pk):
         user = User.objects.get(pk=pk)
         if user.is_superadmin:
             return Response({"error": "Неможливо видалити супер-адміна."}, status=403)
+
+        reassign_to = (
+            request.data.get('reassign_to_admin_id')
+            if hasattr(request, 'data') else None
+        ) or request.query_params.get('reassign_to_admin_id')
+        target_admin = _parse_admin_target(reassign_to)
+        if reassign_to not in (None, '', 'null') and not target_admin:
+            return Response({'error': 'Цільового адміністратора не знайдено'}, status=400)
+        if target_admin and target_admin.id == user.id:
+            return Response({'error': 'Неможливо призначити завдання тому ж адміну'}, status=400)
+
+        _redistribute_admin_tasks(user, target_admin)
         user.delete()
         return Response({"success": True})
     except User.DoesNotExist:
@@ -1861,6 +1948,8 @@ def task_detail(request, pk):
             )
         if effective_group_id != getattr(task, 'group_id', None):
             return Response({'detail': 'Forbidden'}, status=403)
+    elif role == 'admin' and not _can_admin_manage_task(request.user, task):
+        return Response({'detail': 'Forbidden'}, status=403)
 
     if request.method == 'GET':
         return Response({
@@ -1870,6 +1959,7 @@ def task_detail(request, pk):
             'type': task.type,
             'due_date': task.due_date.isoformat() if getattr(task, 'due_date', None) else '',
             'status': task.status,
+            'assigned_admin_id': task.assigned_admin_id,
             'created_at': task.created_at.isoformat() if getattr(task, 'created_at', None) else ''
         })
 
@@ -1903,6 +1993,24 @@ def task_detail(request, pk):
                 task.subject = Subject.objects.get(id=subject_id)
             except Subject.DoesNotExist:
                 pass
+
+        if 'assigned_admin_id' in request.data:
+            if role != 'superadmin':
+                return Response({'detail': 'Forbidden'}, status=403)
+
+            raw_assigned_admin_id = request.data.get('assigned_admin_id')
+            if raw_assigned_admin_id in (None, '', 'null'):
+                task.assigned_admin = None
+            else:
+                try:
+                    assigned_admin_id = int(raw_assigned_admin_id)
+                except (TypeError, ValueError):
+                    return Response({'success': False, 'error': 'Некоректний assigned_admin_id'}, status=400)
+
+                assigned_admin = User.objects.filter(id=assigned_admin_id, role='admin').first()
+                if not assigned_admin:
+                    return Response({'success': False, 'error': 'Адміністратора не знайдено'}, status=404)
+                task.assigned_admin = assigned_admin
 
         task.save()
         return Response({'success': True})
@@ -1958,7 +2066,8 @@ def tasks_list(request):
             due_date=due_date,
             max_grade=request.data.get('max_grade', 100),
             group=group,
-            subject=subject
+            subject=subject,
+            assigned_admin=request.user if role == 'admin' else None,
         )
 
         return Response({
@@ -1969,6 +2078,7 @@ def tasks_list(request):
                 'type': task.type,
                 'max_grade': task.max_grade,
                 'due_date': task.due_date.isoformat() if getattr(task, 'due_date', None) else '',
+                'assigned_admin_id': task.assigned_admin_id,
                 'group': {'id': group.id, 'name': group.name, 'color': group.color} if group else None,
                 'subject': {'id': subject.id, 'name': subject.name, 'short_name': subject.short_name,
                             'color': subject.color} if subject else None,
@@ -1976,7 +2086,7 @@ def tasks_list(request):
         }, status=201)
 
     # GET - повертаємо всі завдання з повною інформацією
-    tasks = Task.objects.select_related('subject', 'group').all()
+    tasks = Task.objects.select_related('subject', 'group', 'assigned_admin').all()
     if role == 'student':
         group_ids = []
         try:
@@ -1999,6 +2109,10 @@ def tasks_list(request):
             tasks = tasks.filter(group_id__in=group_ids)
         else:
             tasks = tasks.none()
+    elif role in ('admin', 'superadmin'):
+        tasks = _scope_tasks_for_role(request.user, tasks)
+    else:
+        return Response({'detail': 'Forbidden'}, status=403)
     result = []
 
     submission_by_task_id = {}
@@ -2027,6 +2141,7 @@ def tasks_list(request):
             'created_at': task.created_at.isoformat() if getattr(task, 'created_at', None) else '',
             'subject': None,
             'group': None,
+            'assigned_admin_id': task.assigned_admin_id,
             'submission': (
                 {
                     'id': submission.id,
@@ -2113,12 +2228,14 @@ def tasks_bulk_create(request):
                 due_date=due_date,
                 max_grade=max_grade,
                 group=group,
-                subject=subject
+                subject=subject,
+                assigned_admin=request.user if _effective_role(request.user) == 'admin' else None,
             )
             created_tasks.append({
                 'id': task.id,
                 'title': task.title,
-                'group': group.name
+                'group': group.name,
+                'assigned_admin_id': task.assigned_admin_id,
             })
         except Group.DoesNotExist:
             continue
@@ -2158,6 +2275,10 @@ def task_submissions(request, pk):
         group_ids = list(dict.fromkeys(group_ids))
         if not group_ids or int(getattr(task, 'group_id', 0) or 0) not in group_ids:
             return Response({'detail': 'Forbidden'}, status=403)
+    elif role == 'admin' and not _can_admin_manage_task(request.user, task):
+        return Response({'detail': 'Forbidden'}, status=403)
+    elif role not in ('admin', 'superadmin'):
+        return Response({'detail': 'Forbidden'}, status=403)
 
     if request.method == 'POST':
         if role != 'student':
@@ -2172,7 +2293,7 @@ def task_submissions(request, pk):
         submission.comment = comment
         submission.status = 'submitted'
         submission.submitted_at = timezone.now()
-        submission.save()
+        submission.save(update_fields=['comment', 'status', 'submitted_at'])
 
         files = []
         try:
@@ -2193,6 +2314,18 @@ def task_submissions(request, pk):
                 file_type=str(getattr(f, 'content_type', '') or 'file')[:20],
             )
             saved_files.append({'id': file_rec.id, 'name': file_rec.file_name, 'url': file_rec.file_url, 'size': file_rec.file_size})
+
+        if getattr(task, 'assigned_admin_id', None):
+            try:
+                Notification.objects.create(
+                    user_id=task.assigned_admin_id,
+                    type='task_submission',
+                    title='Нова здача ДЗ',
+                    message=f"{request.user.name} здав(ла) завдання: {task.title}",
+                    link='/admin/homework',
+                )
+            except Exception:
+                pass
 
         return Response({'success': True, 'submission': {'id': submission.id, 'status': submission.status, 'files': saved_files}}, status=201)
 
@@ -2260,6 +2393,9 @@ def grade_submission(request, pk):
         submission = TaskSubmission.objects.select_related('task', 'student').get(id=pk)
     except TaskSubmission.DoesNotExist:
         return Response({'success': False, 'error': 'Здачу не знайдено'}, status=404)
+
+    if _effective_role(request.user) == 'admin' and not _can_admin_manage_task(request.user, submission.task):
+        return Response({'detail': 'Forbidden'}, status=403)
 
     requested_status = request.data.get('status', None)
     requested_action = request.data.get('action', None)
