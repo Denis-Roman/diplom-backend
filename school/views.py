@@ -3198,10 +3198,20 @@ def news_list(request):
         link = request.data.get('link', '')
 
         image_file = request.FILES.get('image_file')
+        video_file = request.FILES.get('video_file')
+        document_file = request.FILES.get('document_file')
         if image_file:
             safe_name = get_valid_filename(getattr(image_file, 'name', 'image'))
             stored_path = default_storage.save(f"news_images/{safe_name}", image_file)
             image_url = default_storage.url(stored_path)
+        if video_file:
+            safe_name = get_valid_filename(getattr(video_file, 'name', 'video'))
+            stored_path = default_storage.save(f"news_videos/{safe_name}", video_file)
+            video_url = default_storage.url(stored_path)
+        if document_file:
+            safe_name = get_valid_filename(getattr(document_file, 'name', 'document'))
+            stored_path = default_storage.save(f"news_documents/{safe_name}", document_file)
+            link = default_storage.url(stored_path)
 
         # ГОЛОВНЕ! каст bool для is_published (приходить як "true"/"false" — string)
         is_published_raw = request.data.get('is_published', 'false')
@@ -3290,14 +3300,27 @@ def news_detail(request, pk):
 
         image_url = request.data.get('image_url', news.image_url)
         image_file = request.FILES.get('image_file')
+        video_file = request.FILES.get('video_file')
+        document_file = request.FILES.get('document_file')
         if image_file:
             safe_name = get_valid_filename(getattr(image_file, 'name', 'image'))
             stored_path = default_storage.save(f"news_images/{safe_name}", image_file)
             image_url = default_storage.url(stored_path)
         news.image_url = image_url
 
-        news.video_url = request.data.get('video_url', news.video_url)
-        news.link = request.data.get('link', news.link)
+        video_url_value = request.data.get('video_url', news.video_url)
+        if video_file:
+            safe_name = get_valid_filename(getattr(video_file, 'name', 'video'))
+            stored_path = default_storage.save(f"news_videos/{safe_name}", video_file)
+            video_url_value = default_storage.url(stored_path)
+        news.video_url = video_url_value
+
+        link_value = request.data.get('link', news.link)
+        if document_file:
+            safe_name = get_valid_filename(getattr(document_file, 'name', 'document'))
+            stored_path = default_storage.save(f"news_documents/{safe_name}", document_file)
+            link_value = default_storage.url(stored_path)
+        news.link = link_value
         news.save()
         return Response({'success': True})
     if request.method == 'DELETE':
@@ -4861,13 +4884,14 @@ def learning_materials_list(request):
         video_url = (request.data.get('video_url', '') or '').strip()
         link_url = (request.data.get('link_url', '') or '').strip()
         file_obj = request.FILES.get('file')
+        video_file_obj = request.FILES.get('video_file')
 
         if kind == 'article':
             if not content_text:
                 return Response({'success': False, 'error': 'Текст статті обов\'язковий'}, status=400)
         elif kind == 'video':
-            if not video_url:
-                return Response({'success': False, 'error': 'Посилання на відео обов\'язкове'}, status=400)
+            if not video_url and not video_file_obj:
+                return Response({'success': False, 'error': 'Потрібен відеофайл або посилання на відео'}, status=400)
         elif kind in ('document', 'book'):
             if not file_obj and not link_url:
                 return Response({'success': False, 'error': 'Потрібен файл або посилання'}, status=400)
@@ -4924,14 +4948,26 @@ def learning_materials_list(request):
 
         # Build attachment based on kind
         if kind == 'video':
-            a_type = 'youtube' if ('youtube.com' in video_url or 'youtu.be' in video_url) else 'video'
-            LearningMaterialAttachment.objects.create(
-                material=material,
-                type=a_type,
-                name='Video',
-                url=video_url,
-                file_size=None,
-            )
+            if video_file_obj:
+                safe_name = get_valid_filename(getattr(video_file_obj, 'name', 'video'))
+                stored_path = default_storage.save(f"materials/{material.id}/{safe_name}", video_file_obj)
+                url = default_storage.url(stored_path)
+                LearningMaterialAttachment.objects.create(
+                    material=material,
+                    type='video',
+                    name=safe_name,
+                    url=url,
+                    file_size=str(getattr(video_file_obj, 'size', '') or '') or None,
+                )
+            else:
+                a_type = 'youtube' if ('youtube.com' in video_url or 'youtu.be' in video_url) else 'video'
+                LearningMaterialAttachment.objects.create(
+                    material=material,
+                    type=a_type,
+                    name='Video',
+                    url=video_url,
+                    file_size=None,
+                )
         elif kind in ('document', 'book'):
             if file_obj:
                 safe_name = get_valid_filename(getattr(file_obj, 'name', 'file'))
@@ -5252,6 +5288,7 @@ def learning_material_detail(request, pk):
         video_url = (request.data.get('video_url', None) or '').strip() if request.data.get('video_url', None) is not None else None
         link_url = (request.data.get('link_url', None) or '').strip() if request.data.get('link_url', None) is not None else None
         file_obj = request.FILES.get('file')
+        video_file_obj = request.FILES.get('video_file')
 
         kind_changed = kind != prev_kind
 
@@ -5269,20 +5306,32 @@ def learning_material_detail(request, pk):
                 material.content_text = None
 
         if kind == 'video':
-            if video_url is not None:
-                if not video_url:
-                    return Response({'success': False, 'error': 'Посилання на відео обов\'язкове'}, status=400)
+            if video_file_obj or video_url is not None:
+                if video_url is not None and not video_url and not video_file_obj:
+                    return Response({'success': False, 'error': 'Потрібен відеофайл або посилання на відео'}, status=400)
                 material.attachments.all().delete()
-                a_type = 'youtube' if ('youtube.com' in video_url or 'youtu.be' in video_url) else 'video'
-                LearningMaterialAttachment.objects.create(
-                    material=material,
-                    type=a_type,
-                    name='Video',
-                    url=video_url,
-                    file_size=None,
-                )
+                if video_file_obj:
+                    safe_name = get_valid_filename(getattr(video_file_obj, 'name', 'video'))
+                    stored_path = default_storage.save(f"materials/{material.id}/{safe_name}", video_file_obj)
+                    url = default_storage.url(stored_path)
+                    LearningMaterialAttachment.objects.create(
+                        material=material,
+                        type='video',
+                        name=safe_name,
+                        url=url,
+                        file_size=str(getattr(video_file_obj, 'size', '') or '') or None,
+                    )
+                else:
+                    a_type = 'youtube' if ('youtube.com' in video_url or 'youtu.be' in video_url) else 'video'
+                    LearningMaterialAttachment.objects.create(
+                        material=material,
+                        type=a_type,
+                        name='Video',
+                        url=video_url,
+                        file_size=None,
+                    )
             elif kind_changed and material.attachments.count() == 0:
-                return Response({'success': False, 'error': 'Посилання на відео обов\'язкове'}, status=400)
+                return Response({'success': False, 'error': 'Потрібен відеофайл або посилання на відео'}, status=400)
 
         if kind in ('document', 'book'):
             if file_obj or (link_url is not None and link_url):
