@@ -15,6 +15,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
+  GHCR_NAMESPACE: denis-roman
   IMAGE_NAME: diplom-backend
   WEBAPP_NAME: diplom-backend-denis-01
 
@@ -42,8 +43,8 @@ jobs:
           file: ./Dockerfile
           push: true
           tags: |
-            ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:sha-${{ github.sha }}
-            ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:latest
+            ghcr.io/${{ env.GHCR_NAMESPACE }}/${{ env.IMAGE_NAME }}:sha-${{ github.sha }}
+            ghcr.io/${{ env.GHCR_NAMESPACE }}/${{ env.IMAGE_NAME }}:latest
 
   deploy:
     runs-on: ubuntu-latest
@@ -54,4 +55,4 @@ jobs:
         with:
           app-name: ${{ env.WEBAPP_NAME }}
           publish-profile: ${{ secrets.AZURE_WEBAPP_PUBLISH_PROFILE }}
-          images: ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:sha-${{ github.sha }}
+          images: ghcr.io/${{ env.GHCR_NAMESPACE }}/${{ env.IMAGE_NAME }}:sha-${{ github.sha }}
