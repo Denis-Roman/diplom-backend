@@ -5192,7 +5192,7 @@ def learning_materials_list(request):
                             is_published=group_published.get(gid, True),
                         )
                     )
-                LearningMaterialGroup.objects.bulk_create(links, ignore_conflicts=True)
+                LearningMaterialGroup.objects.bulk_create(links)
 
                 if kind == 'video':
                     if video_file_obj:
@@ -5534,7 +5534,6 @@ def learning_material_detail(request, pk):
                     )
                     for gid in group_ids
                 ],
-                ignore_conflicts=True,
             )
 
             # legacy FK = first group
