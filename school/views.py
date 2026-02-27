@@ -14,7 +14,7 @@ from urllib.error import URLError, HTTPError
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
-from django.db import models
+from django.db import models, transaction
 from django.db.models import Sum
 from django.db.models.functions import Coalesce
 from rest_framework.permissions import IsAuthenticated
@@ -33,7 +33,7 @@ from school.models import (
     Attendance, Invoice, Notification, News, ExtraNews, StudentPoint,
     Team, TeamMember, Chat, ChatParticipant, ChatMessage, ChatMessageAttachment, Poll,
     PollOption, CourseMaterial, CourseTest, TestQuestion, QuestionOption, PollVote, Course, Puzzle, LearningMaterial,
-    TaskSubmission, SubmissionFile, InvoicePaymentReceipt, LearningMaterialAttachment,
+    TaskSubmission, SubmissionFile, TaskAttachment, InvoicePaymentReceipt, LearningMaterialAttachment,
     LearningMaterialGroup,
     LearningMaterialFolder,
 )
@@ -794,6 +794,156 @@ def _parse_due_datetime(due_date_raw):
         except Exception:
             pass
     return dt
+
+
+def _parse_json_array(value):
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, tuple):
+        return list(value)
+    if isinstance(value, dict):
+        return [value]
+
+    raw = str(value).strip()
+    if not raw:
+        return []
+
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        return []
+
+    if isinstance(parsed, list):
+        return parsed
+    if isinstance(parsed, dict):
+        return [parsed]
+    return []
+
+
+def _normalize_task_attachment_type(raw_type=None, filename: str = '', content_type: str = '', url: str = '') -> str:
+    allowed = {'document', 'video', 'link', 'file', 'image'}
+    value = str(raw_type or '').strip().lower()
+    if value in allowed:
+        return value
+
+    source = f"{filename} {content_type} {url}".lower()
+    if any(x in source for x in ('.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg', 'image/')):
+        return 'image'
+    if any(x in source for x in ('.mp4', '.mov', '.avi', '.mkv', '.webm', 'video/', 'youtube.com', 'youtu.be')):
+        return 'video'
+    if any(x in source for x in ('.pdf', '.doc', '.docx', '.ppt', '.pptx', '.xls', '.xlsx', '.txt')):
+        return 'document'
+    if url:
+        return 'link'
+    return 'file'
+
+
+def _format_file_size(size_raw) -> str | None:
+    try:
+        size = int(size_raw or 0)
+    except Exception:
+        return None
+
+    if size <= 0:
+        return None
+    if size < 1024:
+        return f"{size} B"
+    if size < 1024 * 1024:
+        return f"{size / 1024:.1f} KB"
+    return f"{size / (1024 * 1024):.1f} MB"
+
+
+def _collect_task_attachment_payload(request):
+    link_items = []
+    raw_links = _parse_json_array(request.data.get('attachments_json'))
+    for item in raw_links:
+        if not isinstance(item, dict):
+            continue
+        url = str(item.get('url') or '').strip()
+        if not url:
+            continue
+
+        name = str(item.get('name') or '').strip() or url
+        file_size = str(item.get('file_size') or '').strip() or None
+        atype = _normalize_task_attachment_type(item.get('type'), url=url)
+        link_items.append({
+            'type': atype,
+            'name': name,
+            'url': url,
+            'file_size': file_size,
+        })
+
+    file_names = _parse_json_array(request.data.get('attachment_file_names'))
+    file_types = _parse_json_array(request.data.get('attachment_file_types'))
+
+    uploads = []
+    files = []
+    try:
+        files = request.FILES.getlist('attachment_files')
+    except Exception:
+        files = []
+
+    for index, f in enumerate(files):
+        explicit_name = ''
+        if index < len(file_names):
+            explicit_name = str(file_names[index] or '').strip()
+
+        explicit_type = None
+        if index < len(file_types):
+            explicit_type = str(file_types[index] or '').strip().lower()
+
+        safe_name = get_valid_filename(getattr(f, 'name', 'file'))
+        display_name = explicit_name or os.path.splitext(safe_name)[0] or safe_name
+        atype = _normalize_task_attachment_type(
+            explicit_type,
+            filename=safe_name,
+            content_type=str(getattr(f, 'content_type', '') or ''),
+        )
+        uploads.append({
+            'file': f,
+            'type': atype,
+            'name': display_name,
+            'file_size': _format_file_size(getattr(f, 'size', 0)),
+        })
+
+    return {'links': link_items, 'uploads': uploads}
+
+
+def _apply_task_attachments(task: Task, payload: dict, *, replace: bool = False):
+    if replace:
+        task.attachments.all().delete()
+
+    for item in payload.get('links', []):
+        TaskAttachment.objects.create(
+            task=task,
+            type=item.get('type') or 'link',
+            name=item.get('name') or 'Посилання',
+            url=item.get('url') or '',
+            file_size=item.get('file_size') or None,
+        )
+
+    for item in payload.get('uploads', []):
+        f = item.get('file')
+        if not f:
+            continue
+        try:
+            f.seek(0)
+        except Exception:
+            pass
+
+        safe_name = get_valid_filename(getattr(f, 'name', 'file'))
+        stored_path = default_storage.save(f"task_attachments/{task.id}/{safe_name}", f)
+        url = f"{settings.MEDIA_URL}{stored_path}"
+
+        TaskAttachment.objects.create(
+            task=task,
+            type=item.get('type') or 'file',
+            name=item.get('name') or (os.path.splitext(safe_name)[0] or safe_name),
+            url=url,
+            file_size=item.get('file_size') or None,
+        )
 
 
 @api_view(['GET'])
@@ -1983,6 +2133,7 @@ def lesson_grades(request, pk):
 # ===== TASKS =====
 @api_view(['GET', 'PUT', 'DELETE'])
 @permission_classes([IsAuthenticated])
+@parser_classes([JSONParser, MultiPartParser, FormParser])
 def task_detail(request, pk):
     role = _effective_role(getattr(request, 'user', None))
     try:
@@ -2010,9 +2161,19 @@ def task_detail(request, pk):
             'description': task.description,
             'type': task.type,
             'due_date': task.due_date.isoformat() if getattr(task, 'due_date', None) else '',
-            'status': task.status,
+            'status': getattr(task, 'status', ''),
             'assigned_admin_id': task.assigned_admin_id,
-            'created_at': task.created_at.isoformat() if getattr(task, 'created_at', None) else ''
+            'created_at': task.created_at.isoformat() if getattr(task, 'created_at', None) else '',
+            'attachments': [
+                {
+                    'id': a.id,
+                    'type': a.type,
+                    'name': a.name,
+                    'url': _absolute_file_url(request, a.url),
+                    'file_size': a.file_size,
+                }
+                for a in task.attachments.all()
+            ],
         })
 
     if request.method == 'DELETE':
@@ -2027,8 +2188,16 @@ def task_detail(request, pk):
         task.title = request.data.get('title', task.title)
         task.description = request.data.get('description', task.description)
         task.type = request.data.get('type', task.type)
-        task.due_date = request.data.get('due_date', task.due_date)
-        task.max_grade = request.data.get('max_grade', task.max_grade)
+
+        if 'due_date' in request.data:
+            due_date = _parse_due_datetime(request.data.get('due_date'))
+            task.due_date = due_date
+
+        if 'max_grade' in request.data:
+            try:
+                task.max_grade = int(request.data.get('max_grade'))
+            except (TypeError, ValueError):
+                pass
 
         # Оновлюємо group
         group_id = request.data.get('group_id')
@@ -2065,11 +2234,23 @@ def task_detail(request, pk):
                 task.assigned_admin = assigned_admin
 
         task.save()
+
+        has_attachment_payload = (
+            ('attachments_json' in request.data)
+            or ('attachment_file_names' in request.data)
+            or ('attachment_file_types' in request.data)
+            or bool(request.FILES.getlist('attachment_files'))
+        )
+        if has_attachment_payload:
+            payload = _collect_task_attachment_payload(request)
+            _apply_task_attachments(task, payload, replace=True)
+
         return Response({'success': True})
 
 
 @api_view(['GET', 'POST'])
 @permission_classes([IsAuthenticated])
+@parser_classes([JSONParser, MultiPartParser, FormParser])
 def tasks_list(request):
     role = _effective_role(getattr(request, 'user', None))
     if request.method == 'POST':
@@ -2122,6 +2303,9 @@ def tasks_list(request):
             assigned_admin=request.user if role == 'admin' else None,
         )
 
+        payload = _collect_task_attachment_payload(request)
+        _apply_task_attachments(task, payload, replace=False)
+
         return Response({
             'success': True,
             'task': {
@@ -2134,11 +2318,21 @@ def tasks_list(request):
                 'group': {'id': group.id, 'name': group.name, 'color': group.color} if group else None,
                 'subject': {'id': subject.id, 'name': subject.name, 'short_name': subject.short_name,
                             'color': subject.color} if subject else None,
+                'attachments': [
+                    {
+                        'id': a.id,
+                        'type': a.type,
+                        'name': a.name,
+                        'url': _absolute_file_url(request, a.url),
+                        'file_size': a.file_size,
+                    }
+                    for a in task.attachments.all()
+                ],
             }
         }, status=201)
 
     # GET - повертаємо всі завдання з повною інформацією
-    tasks = Task.objects.select_related('subject', 'group', 'assigned_admin').all()
+    tasks = Task.objects.select_related('subject', 'group', 'assigned_admin').prefetch_related('attachments').all()
     if role == 'student':
         group_ids = []
         try:
@@ -2195,6 +2389,16 @@ def tasks_list(request):
             'subject': None,
             'group': None,
             'assigned_admin_id': task.assigned_admin_id,
+            'attachments': [
+                {
+                    'id': a.id,
+                    'type': a.type,
+                    'name': a.name,
+                    'url': _absolute_file_url(request, a.url),
+                    'file_size': a.file_size,
+                }
+                for a in task.attachments.all()
+            ],
             'submission': (
                 {
                     'id': submission.id,
@@ -2243,6 +2447,7 @@ def tasks_list(request):
 
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
+@parser_classes([JSONParser, MultiPartParser, FormParser])
 def tasks_bulk_create(request):
     forbidden = _require_roles(request, ('admin', 'superadmin'))
     if forbidden:
@@ -2253,7 +2458,17 @@ def tasks_bulk_create(request):
     task_type = request.data.get('type', 'homework')
     due_date = _parse_due_datetime(request.data.get('due_date'))
     max_grade = request.data.get('max_grade', 100)
-    group_ids = request.data.get('group_ids', [])
+    group_ids = _parse_json_array(request.data.get('group_ids'))
+    if not group_ids and isinstance(request.data.get('group_ids'), list):
+        group_ids = request.data.get('group_ids', [])
+
+    normalized_group_ids = []
+    for raw_gid in group_ids:
+        try:
+            normalized_group_ids.append(int(raw_gid))
+        except (TypeError, ValueError):
+            continue
+    group_ids = list(dict.fromkeys(normalized_group_ids))
     subject_id = request.data.get('subject_id')
 
     if not title:
@@ -2273,6 +2488,7 @@ def tasks_bulk_create(request):
             pass
 
     created_tasks = []
+    payload = _collect_task_attachment_payload(request)
 
     for group_id in group_ids:
         try:
@@ -2294,6 +2510,7 @@ def tasks_bulk_create(request):
                 subject=subject,
                 assigned_admin=request.user if _effective_role(request.user) == 'admin' else None,
             )
+            _apply_task_attachments(task, payload, replace=False)
             created_tasks.append({
                 'id': task.id,
                 'title': task.title,
@@ -4859,6 +5076,19 @@ def learning_materials_list(request):
         if not group_ids:
             return Response({'success': False, 'error': 'Оберіть хоча б одну групу'}, status=400)
 
+        existing_group_ids = set(
+            Group.objects.filter(id__in=group_ids).values_list('id', flat=True)
+        )
+        missing_group_ids = [gid for gid in group_ids if gid not in existing_group_ids]
+        if missing_group_ids:
+            return Response(
+                {
+                    'success': False,
+                    'error': f"Некоректні групи: {', '.join(str(x) for x in missing_group_ids)}",
+                },
+                status=400,
+            )
+
         subject = None
         subject_id = request.data.get('subject_id')
         if subject_id is not None and str(subject_id).strip() != '':
@@ -4903,118 +5133,120 @@ def learning_materials_list(request):
         except Exception:
             legacy_group = None
 
-        material = LearningMaterial.objects.create(
-            title=title,
-            description=description,
-            type=material_type,
-            kind=kind,
-            content_text=content_text if kind == 'article' else None,
-            group=legacy_group,
-            folder=folder,
-            subject=subject,
-            is_published=is_published,
-        )
-
-        group_published_raw = request.data.get('group_published')
-        group_published = {}
-        if group_published_raw is not None:
-            try:
-                items = group_published_raw
-                if not isinstance(items, list):
-                    items = json.loads(str(group_published_raw))
-                if isinstance(items, list):
-                    for item in items:
-                        if not isinstance(item, dict):
-                            continue
-                        gid = item.get('group_id')
-                        try:
-                            gid_int = int(gid)
-                        except Exception:
-                            continue
-                        group_published[gid_int] = _parse_bool(item.get('is_published', True), default=True)
-            except Exception:
-                group_published = {}
-
-        links = []
-        for gid in group_ids:
-            links.append(
-                LearningMaterialGroup(
-                    material=material,
-                    group_id=gid,
-                    is_published=group_published.get(gid, True),
-                )
-            )
-        LearningMaterialGroup.objects.bulk_create(links, ignore_conflicts=True)
-
-        # Build attachment based on kind
-        if kind == 'video':
-            if video_file_obj:
-                safe_name = get_valid_filename(getattr(video_file_obj, 'name', 'video'))
-                stored_path = default_storage.save(f"materials/{material.id}/{safe_name}", video_file_obj)
-                url = default_storage.url(stored_path)
-                LearningMaterialAttachment.objects.create(
-                    material=material,
-                    type='video',
-                    name=safe_name,
-                    url=url,
-                    file_size=str(getattr(video_file_obj, 'size', '') or '') or None,
-                )
-            else:
-                a_type = 'youtube' if ('youtube.com' in video_url or 'youtu.be' in video_url) else 'video'
-                LearningMaterialAttachment.objects.create(
-                    material=material,
-                    type=a_type,
-                    name='Video',
-                    url=video_url,
-                    file_size=None,
-                )
-        elif kind in ('document', 'book'):
-            if file_obj:
-                safe_name = get_valid_filename(getattr(file_obj, 'name', 'file'))
-                stored_path = default_storage.save(f"materials/{material.id}/{safe_name}", file_obj)
-                url = default_storage.url(stored_path)
-                LearningMaterialAttachment.objects.create(
-                    material=material,
-                    type='document' if kind == 'document' else 'file',
-                    name=safe_name,
-                    url=url,
-                    file_size=str(getattr(file_obj, 'size', '') or '') or None,
-                )
-            elif link_url:
-                LearningMaterialAttachment.objects.create(
-                    material=material,
-                    type='document' if kind == 'document' else 'file',
-                    name='Link',
-                    url=link_url,
-                    file_size=None,
-                )
-
-        # Create notifications for students in target groups
         try:
-            student_ids = set(
-                User.objects.filter(role='student', group_id__in=group_ids).values_list('id', flat=True)
-            )
-            extra_ids = set(
-                GroupStudent.objects.filter(group_id__in=group_ids).values_list('student_id', flat=True)
-            )
-            student_ids.update(extra_ids)
-            notifications = []
-            for sid in student_ids:
-                notifications.append(
-                    Notification(
-                        user_id=sid,
-                        type='material',
-                        title=f"Новий матеріал: {material.title}",
-                        message=(material.description or '')[:500],
-                        link=f"/dashboard/materials?materialId={material.id}",
-                    )
+            with transaction.atomic():
+                material = LearningMaterial.objects.create(
+                    title=title,
+                    description=description,
+                    type=material_type,
+                    kind=kind,
+                    content_text=content_text if kind == 'article' else None,
+                    group=legacy_group,
+                    folder=folder,
+                    subject=subject,
+                    is_published=is_published,
                 )
-            if notifications:
-                Notification.objects.bulk_create(notifications)
-        except Exception:
-            pass
 
-        return Response({'success': True, 'material': {'id': material.id, 'title': material.title}}, status=201)
+                group_published_raw = request.data.get('group_published')
+                group_published = {}
+                if group_published_raw is not None:
+                    try:
+                        items = group_published_raw
+                        if not isinstance(items, list):
+                            items = json.loads(str(group_published_raw))
+                        if isinstance(items, list):
+                            for item in items:
+                                if not isinstance(item, dict):
+                                    continue
+                                gid = item.get('group_id')
+                                try:
+                                    gid_int = int(gid)
+                                except Exception:
+                                    continue
+                                group_published[gid_int] = _parse_bool(item.get('is_published', True), default=True)
+                    except Exception:
+                        group_published = {}
+
+                links = []
+                for gid in group_ids:
+                    links.append(
+                        LearningMaterialGroup(
+                            material=material,
+                            group_id=gid,
+                            is_published=group_published.get(gid, True),
+                        )
+                    )
+                LearningMaterialGroup.objects.bulk_create(links, ignore_conflicts=True)
+
+                if kind == 'video':
+                    if video_file_obj:
+                        safe_name = get_valid_filename(getattr(video_file_obj, 'name', 'video'))
+                        stored_path = default_storage.save(f"materials/{material.id}/{safe_name}", video_file_obj)
+                        url = default_storage.url(stored_path)
+                        LearningMaterialAttachment.objects.create(
+                            material=material,
+                            type='video',
+                            name=safe_name,
+                            url=url,
+                            file_size=str(getattr(video_file_obj, 'size', '') or '') or None,
+                        )
+                    else:
+                        a_type = 'youtube' if ('youtube.com' in video_url or 'youtu.be' in video_url) else 'video'
+                        LearningMaterialAttachment.objects.create(
+                            material=material,
+                            type=a_type,
+                            name='Video',
+                            url=video_url,
+                            file_size=None,
+                        )
+                elif kind in ('document', 'book'):
+                    if file_obj:
+                        safe_name = get_valid_filename(getattr(file_obj, 'name', 'file'))
+                        stored_path = default_storage.save(f"materials/{material.id}/{safe_name}", file_obj)
+                        url = default_storage.url(stored_path)
+                        LearningMaterialAttachment.objects.create(
+                            material=material,
+                            type='document' if kind == 'document' else 'file',
+                            name=safe_name,
+                            url=url,
+                            file_size=str(getattr(file_obj, 'size', '') or '') or None,
+                        )
+                    elif link_url:
+                        LearningMaterialAttachment.objects.create(
+                            material=material,
+                            type='document' if kind == 'document' else 'file',
+                            name='Link',
+                            url=link_url,
+                            file_size=None,
+                        )
+
+                try:
+                    student_ids = set(
+                        User.objects.filter(role='student', group_id__in=group_ids).values_list('id', flat=True)
+                    )
+                    extra_ids = set(
+                        GroupStudent.objects.filter(group_id__in=group_ids).values_list('student_id', flat=True)
+                    )
+                    student_ids.update(extra_ids)
+                    notifications = []
+                    for sid in student_ids:
+                        notifications.append(
+                            Notification(
+                                user_id=sid,
+                                type='material',
+                                title=f"Новий матеріал: {material.title}",
+                                message=(material.description or '')[:500],
+                                link=f"/dashboard/materials?materialId={material.id}",
+                            )
+                        )
+                    if notifications:
+                        Notification.objects.bulk_create(notifications)
+                except Exception:
+                    pass
+
+                return Response({'success': True, 'material': {'id': material.id, 'title': material.title}}, status=201)
+        except Exception as exc:
+            return Response({'success': False, 'error': f'Помилка збереження матеріалу: {exc}'}, status=500)
 
     materials = (
         LearningMaterial.objects
@@ -5243,6 +5475,19 @@ def learning_material_detail(request, pk):
             group_ids = _parse_int_list(group_ids_raw)
             if not group_ids:
                 return Response({'success': False, 'error': 'Оберіть хоча б одну групу'}, status=400)
+
+            existing_group_ids = set(
+                Group.objects.filter(id__in=group_ids).values_list('id', flat=True)
+            )
+            missing_group_ids = [gid for gid in group_ids if gid not in existing_group_ids]
+            if missing_group_ids:
+                return Response(
+                    {
+                        'success': False,
+                        'error': f"Некоректні групи: {', '.join(str(x) for x in missing_group_ids)}",
+                    },
+                    status=400,
+                )
 
             published_map = {}
             if group_published_raw is not None:
