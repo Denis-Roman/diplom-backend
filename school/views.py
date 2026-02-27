@@ -1030,13 +1030,18 @@ def admin_delete(request, pk):
 @api_view(['POST'])
 @permission_classes([AllowAny])
 def auth_login(request):
-    email = request.data.get('email', '')
+    email = (request.data.get('email', '') or '').strip()
     password = request.data.get('password', '')
     if not email or not password:
         return Response({'success': False, 'error': "Email та пароль обов'язкові"}, status=400)
-    try:
-        user = User.objects.get(email=email)
-    except User.DoesNotExist:
+
+    user = (
+        User.objects
+        .filter(models.Q(email__iexact=email) | models.Q(name__iexact=email))
+        .order_by('id')
+        .first()
+    )
+    if not user:
         return Response({'success': False, 'error': 'Невірний email або пароль'}, status=401)
 
     password_ok = False
@@ -1055,6 +1060,17 @@ def auth_login(request):
                 if password_ok:
                     user.password = make_password(password)
                     user.save(update_fields=['password'])
+        except Exception:
+            password_ok = False
+
+    # Backward compatibility: very old records may contain plain-text password.
+    if not password_ok:
+        try:
+            stored = str(user.password or '')
+            if stored and stored == str(password):
+                password_ok = True
+                user.password = make_password(password)
+                user.save(update_fields=['password'])
         except Exception:
             password_ok = False
 
