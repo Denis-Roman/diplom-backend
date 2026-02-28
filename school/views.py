@@ -128,6 +128,7 @@ def _absolute_file_url(request, url: str | None) -> str:
 
 
 ONLINE_TIMEOUT_SECONDS = 120
+QUIZ_SUBMISSION_PREFIX = 'QUIZ_RESULT::'
 
 
 def _presence_cache_key(user_id: int | None) -> str:
@@ -175,6 +176,112 @@ def _is_user_online(user_id: int | None) -> bool:
         now_ts = datetime.datetime.now().timestamp()
 
     return (now_ts - last_seen_ts) <= ONLINE_TIMEOUT_SECONDS
+
+
+def _split_submission_comment_and_quiz(comment_value):
+    raw = str(comment_value or '')
+    marker_pos = raw.rfind(QUIZ_SUBMISSION_PREFIX)
+    if marker_pos < 0:
+        clean_comment = raw.strip() or None
+        return clean_comment, None
+
+    clean_comment = raw[:marker_pos].strip() or None
+    quiz_raw = raw[marker_pos + len(QUIZ_SUBMISSION_PREFIX):].strip()
+    if not quiz_raw:
+        return clean_comment, None
+
+    try:
+        parsed = json.loads(quiz_raw)
+    except Exception:
+        parsed = None
+
+    return clean_comment, _normalize_quiz_result(parsed)
+
+
+def _serialize_submission_comment(comment_value, quiz_result):
+    clean_comment = str(comment_value or '').strip()
+    normalized_quiz = _normalize_quiz_result(quiz_result)
+    if not normalized_quiz:
+        return clean_comment or None
+
+    quiz_json = json.dumps(normalized_quiz, ensure_ascii=False)
+    if clean_comment:
+        return f"{clean_comment}\n\n{QUIZ_SUBMISSION_PREFIX}{quiz_json}"
+    return f"{QUIZ_SUBMISSION_PREFIX}{quiz_json}"
+
+
+def _normalize_quiz_result(value):
+    if not isinstance(value, dict):
+        return None
+
+    answers_raw = value.get('answers')
+    normalized_answers = []
+    if isinstance(answers_raw, list):
+        for answer in answers_raw[:200]:
+            if not isinstance(answer, dict):
+                continue
+            question_text = str(answer.get('question_text') or '').strip()[:500]
+            selected_option = answer.get('selected_option')
+            correct_option = answer.get('correct_option')
+            normalized_answers.append({
+                'question_text': question_text,
+                'selected_option': (str(selected_option).strip()[:500] if selected_option is not None else None),
+                'correct_option': (str(correct_option).strip()[:500] if correct_option is not None else None),
+                'is_correct': bool(answer.get('is_correct')),
+            })
+
+    total_questions_raw = value.get('total_questions')
+    correct_answers_raw = value.get('correct_answers')
+
+    try:
+        total_questions = int(total_questions_raw)
+    except Exception:
+        total_questions = len(normalized_answers)
+
+    if total_questions < 0:
+        total_questions = 0
+
+    try:
+        correct_answers = int(correct_answers_raw)
+    except Exception:
+        correct_answers = sum(1 for answer in normalized_answers if answer.get('is_correct'))
+
+    if correct_answers < 0:
+        correct_answers = 0
+    if total_questions and correct_answers > total_questions:
+        correct_answers = total_questions
+
+    incorrect_answers = max(total_questions - correct_answers, 0)
+
+    percentage_raw = value.get('percentage')
+    try:
+        percentage = float(percentage_raw)
+    except Exception:
+        percentage = (correct_answers / total_questions * 100.0) if total_questions > 0 else 0.0
+
+    if percentage < 0:
+        percentage = 0.0
+    if percentage > 100:
+        percentage = 100.0
+
+    time_spent_seconds_raw = value.get('time_spent_seconds')
+    try:
+        time_spent_seconds = int(time_spent_seconds_raw)
+    except Exception:
+        time_spent_seconds = None
+
+    if time_spent_seconds is not None and time_spent_seconds < 0:
+        time_spent_seconds = 0
+
+    return {
+        'format': 'material_test_result_v1',
+        'total_questions': total_questions,
+        'correct_answers': correct_answers,
+        'incorrect_answers': incorrect_answers,
+        'percentage': round(percentage, 2),
+        'time_spent_seconds': time_spent_seconds,
+        'answers': normalized_answers,
+    }
 
 
 def _can_admin_manage_task(user: User, task: Task) -> bool:
@@ -2468,6 +2575,11 @@ def tasks_list(request):
 
     for task in tasks:
         submission = submission_by_task_id.get(int(task.id)) if role == 'student' else None
+        submission_comment = None
+        submission_quiz_result = None
+        if submission is not None:
+            submission_comment, submission_quiz_result = _split_submission_comment_and_quiz(submission.comment)
+
         task_data = {
             'id': task.id,
             'title': task.title,
@@ -2494,7 +2606,8 @@ def tasks_list(request):
                     'id': submission.id,
                     'status': submission.status,
                     'grade': submission.grade,
-                    'comment': submission.comment,
+                    'comment': submission_comment,
+                    'quiz_result': submission_quiz_result,
                     'teacher_comment': getattr(submission, 'teacher_comment', None),
                     'submitted_at': submission.submitted_at.isoformat() if getattr(submission, 'submitted_at', None) else None,
                     'files': [
@@ -2655,13 +2768,24 @@ def task_submissions(request, pk):
             return Response({'detail': 'Forbidden'}, status=403)
 
         comment = str(request.data.get('comment', '') or '').strip() or None
+        quiz_result = None
+        quiz_result_raw = request.data.get('quiz_result')
+        if quiz_result_raw not in (None, ''):
+            if isinstance(quiz_result_raw, dict):
+                quiz_result = _normalize_quiz_result(quiz_result_raw)
+            else:
+                try:
+                    quiz_result = _normalize_quiz_result(json.loads(str(quiz_result_raw)))
+                except Exception:
+                    quiz_result = None
+
         files = []
         try:
             files = request.FILES.getlist('files')
         except Exception:
             files = []
 
-        if not comment and not files:
+        if not comment and not files and not quiz_result:
             return Response({'success': False, 'error': 'Додайте файл або коментар'}, status=400)
 
         submission, _created = TaskSubmission.objects.get_or_create(
@@ -2673,7 +2797,7 @@ def task_submissions(request, pk):
         if submission.status == 'graded':
             return Response({'success': False, 'error': 'Це завдання вже оцінене і не може бути перездане'}, status=400)
 
-        submission.comment = comment
+        submission.comment = _serialize_submission_comment(comment, quiz_result)
         submission.status = 'submitted'
         submission.submitted_at = timezone.now()
         submission.save(update_fields=['comment', 'status', 'submitted_at'])
@@ -2707,7 +2831,20 @@ def task_submissions(request, pk):
             except Exception:
                 pass
 
-        return Response({'success': True, 'submission': {'id': submission.id, 'status': submission.status, 'files': saved_files}}, status=201)
+        clean_comment, parsed_quiz_result = _split_submission_comment_and_quiz(submission.comment)
+        return Response(
+            {
+                'success': True,
+                'submission': {
+                    'id': submission.id,
+                    'status': submission.status,
+                    'comment': clean_comment,
+                    'quiz_result': parsed_quiz_result,
+                    'files': saved_files,
+                },
+            },
+            status=201,
+        )
 
     submissions_qs = (
         TaskSubmission.objects
@@ -2717,33 +2854,46 @@ def task_submissions(request, pk):
     )
     if role == 'student':
         submissions_qs = submissions_qs.filter(student=request.user)
-        return Response([
-            {
-                'id': s.id,
-                'status': s.status,
-                'grade': s.grade,
-                'comment': s.comment,
-                'teacher_comment': getattr(s, 'teacher_comment', None) or None,
-                'submitted_at': s.submitted_at.isoformat() if getattr(s, 'submitted_at', None) else None,
-                'files': [
-                    {'id': f.id, 'name': f.file_name, 'url': _absolute_file_url(request, f.file_url), 'size': f.file_size, 'type': f.file_type}
-                    for f in s.files.all()
-                ],
-            }
-            for s in submissions_qs
-        ])
+        student_rows = []
+        for s in submissions_qs:
+            clean_comment, quiz_result = _split_submission_comment_and_quiz(s.comment)
+            student_rows.append(
+                {
+                    'id': s.id,
+                    'status': s.status,
+                    'grade': s.grade,
+                    'comment': clean_comment,
+                    'quiz_result': quiz_result,
+                    'teacher_comment': getattr(s, 'teacher_comment', None) or None,
+                    'submitted_at': s.submitted_at.isoformat() if getattr(s, 'submitted_at', None) else None,
+                    'files': [
+                        {
+                            'id': f.id,
+                            'name': f.file_name,
+                            'url': _absolute_file_url(request, f.file_url),
+                            'size': f.file_size,
+                            'type': f.file_type,
+                        }
+                        for f in s.files.all()
+                    ],
+                }
+            )
+        return Response(student_rows)
 
     if role not in ('admin', 'superadmin'):
         return Response({'detail': 'Forbidden'}, status=403)
-    return Response(
-        [
+    admin_rows = []
+    for s in submissions_qs:
+        clean_comment, quiz_result = _split_submission_comment_and_quiz(s.comment)
+        admin_rows.append(
             {
                 'id': s.id,
                 'student': s.student.name,
                 'student_id': s.student_id,
                 'status': s.status,
                 'grade': s.grade,
-                'comment': s.comment,
+                'comment': clean_comment,
+                'quiz_result': quiz_result,
                 'teacher_comment': getattr(s, 'teacher_comment', None) or None,
                 'submitted_at': s.submitted_at.isoformat() if getattr(s, 'submitted_at', None) else None,
                 'files': [
@@ -2757,9 +2907,9 @@ def task_submissions(request, pk):
                     for f in s.files.all()
                 ],
             }
-            for s in submissions_qs
-        ]
-    )
+        )
+
+    return Response(admin_rows)
 
 
 @api_view(['POST', 'PUT'])
@@ -5255,7 +5405,8 @@ def learning_materials_list(request):
             except Exception:
                 group_ids = []
 
-        if not group_ids:
+        is_quiz_template = str(description).startswith('QUIZ_JSON::')
+        if not group_ids and not is_quiz_template:
             return Response({'success': False, 'error': 'Оберіть хоча б одну групу'}, status=400)
 
         existing_group_ids = set(
