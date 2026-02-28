@@ -58,6 +58,7 @@ from django.contrib.auth.hashers import make_password
 from django.utils import timezone
 from django.contrib.auth.hashers import make_password
 from django.contrib.auth.hashers import make_password, check_password
+from django.core.cache import cache
 from django.contrib.auth.hashers import make_password, check_password
 
 from rest_framework.decorators import api_view, permission_classes
@@ -124,6 +125,56 @@ def _absolute_file_url(request, url: str | None) -> str:
     if raw.startswith('/'):
         return request.build_absolute_uri(raw)
     return request.build_absolute_uri(f'/{raw}')
+
+
+ONLINE_TIMEOUT_SECONDS = 120
+
+
+def _presence_cache_key(user_id: int | None) -> str:
+    return f"user_online:{int(user_id or 0)}"
+
+
+def _mark_user_online(user) -> None:
+    try:
+        user_id = int(getattr(user, 'id', 0) or 0)
+    except Exception:
+        user_id = 0
+    if user_id <= 0:
+        return
+
+    try:
+        cache.set(_presence_cache_key(user_id), timezone.now().timestamp(), timeout=ONLINE_TIMEOUT_SECONDS * 3)
+    except Exception:
+        pass
+
+
+def _is_user_online(user_id: int | None) -> bool:
+    try:
+        uid = int(user_id or 0)
+    except Exception:
+        return False
+    if uid <= 0:
+        return False
+
+    try:
+        value = cache.get(_presence_cache_key(uid))
+    except Exception:
+        return False
+
+    if value is None:
+        return False
+
+    try:
+        last_seen_ts = float(value)
+    except Exception:
+        return False
+
+    try:
+        now_ts = timezone.now().timestamp()
+    except Exception:
+        now_ts = datetime.datetime.now().timestamp()
+
+    return (now_ts - last_seen_ts) <= ONLINE_TIMEOUT_SECONDS
 
 
 def _can_admin_manage_task(user: User, task: Task) -> bool:
@@ -953,6 +1004,8 @@ def auth_me(request):
     if not isinstance(user, User):
         return Response({'success': True, 'user': None}, status=200)
 
+    _mark_user_online(user)
+
     effective_role = _effective_role(user) or 'student'
     effective_group_id = getattr(user, 'group_id', None)
     if not effective_group_id:
@@ -1717,12 +1770,19 @@ def groups_list(request):
     for group in groups:
         students_data = []
         if role in ('admin', 'superadmin'):
-            group_students = GroupStudent.objects.filter(group=group).select_related('student')
-            students_data = [{
-                'id': gs.student.id,
-                'name': gs.student.name,
-                'email': gs.student.email
-            } for gs in group_students]
+            members_qs = User.objects.filter(
+                models.Q(group_memberships__group=group) | models.Q(group_id=group.id),
+                is_active=True,
+            ).distinct()
+            students_data = [
+                {
+                    'id': member.id,
+                    'name': member.name,
+                    'email': member.email,
+                }
+                for member in members_qs
+                if _effective_role(member) == 'student'
+            ]
 
         result.append({
             'id': group.id,
@@ -1765,12 +1825,19 @@ def group_detail(request, pk):
             return Response({'detail': 'Forbidden'}, status=403)
 
     if request.method == 'GET':
-        group_students = GroupStudent.objects.filter(group=group).select_related('student')
-        students_data = [{
-            'id': gs.student.id,
-            'name': gs.student.name,
-            'email': gs.student.email
-        } for gs in group_students]
+        members_qs = User.objects.filter(
+            models.Q(group_memberships__group=group) | models.Q(group_id=group.id),
+            is_active=True,
+        ).distinct()
+        students_data = [
+            {
+                'id': member.id,
+                'name': member.name,
+                'email': member.email,
+            }
+            for member in members_qs
+            if _effective_role(member) == 'student'
+        ]
 
         return Response({
             'id': group.id,
@@ -1791,12 +1858,19 @@ def group_detail(request, pk):
         group.schedule = request.data.get('schedule', group.schedule)
         group.save()
 
-        group_students = GroupStudent.objects.filter(group=group).select_related('student')
-        students_data = [{
-            'id': gs.student.id,
-            'name': gs.student.name,
-            'email': gs.student.email
-        } for gs in group_students]
+        members_qs = User.objects.filter(
+            models.Q(group_memberships__group=group) | models.Q(group_id=group.id),
+            is_active=True,
+        ).distinct()
+        students_data = [
+            {
+                'id': member.id,
+                'name': member.name,
+                'email': member.email,
+            }
+            for member in members_qs
+            if _effective_role(member) == 'student'
+        ]
 
         return Response({
             'success': True,
@@ -3632,6 +3706,7 @@ def extra_news_detail(request, pk):
 @api_view(['GET', 'POST'])
 @permission_classes([IsAuthenticated])
 def chats_list(request):
+    _mark_user_online(getattr(request, 'user', None))
     role = _effective_role(getattr(request, 'user', None))
     if request.method == 'POST':
         type_raw = str(request.data.get('type', '') or '').strip().lower() or 'private'
@@ -3690,14 +3765,24 @@ def chats_list(request):
     for c in chats_qs.order_by('-created_at'):
         participants = (
             User.objects.filter(chat_participations__chat=c)
-            .only('id', 'name', 'email')
+            .only('id', 'name', 'email', 'role', 'avatar_url')
             .all()
         )
         result.append({
             'id': c.id,
             'name': c.name,
             'type': c.type,
-            'participants': [{'id': u.id, 'name': u.name, 'email': u.email} for u in participants],
+            'participants': [
+                {
+                    'id': u.id,
+                    'name': u.name,
+                    'email': u.email,
+                    'role': _effective_role(u) or getattr(u, 'role', None),
+                    'avatar_url': u.avatar_url or '',
+                    'is_online': _is_user_online(u.id),
+                }
+                for u in participants
+            ],
         })
     return Response(result)
 
@@ -3735,6 +3820,7 @@ def chat_detail(request, pk):
 @permission_classes([IsAuthenticated])
 @parser_classes([MultiPartParser, FormParser])
 def chat_messages(request, pk):
+    _mark_user_online(getattr(request, 'user', None))
     try:
         chat = Chat.objects.get(id=pk)
     except Chat.DoesNotExist:
@@ -5876,6 +5962,7 @@ def notification_read(request, pk):
 @api_view(['GET', 'POST'])
 @permission_classes([IsAuthenticated])
 def users_list(request):
+    _mark_user_online(getattr(request, 'user', None))
     role = _effective_role(getattr(request, 'user', None))
     requested_role = str(request.query_params.get('role', '') or '').strip().lower()
 
@@ -5934,7 +6021,7 @@ def users_list(request):
                 group = Group.objects.get(id=group_id)
                 user.group = group
                 user.save()
-                if user.role == 'student':
+                if _effective_role(user) == 'student':
                     GroupStudent.objects.get_or_create(group=group, student=user)
             except Group.DoesNotExist:
                 pass
@@ -5986,6 +6073,7 @@ def users_list(request):
                 'role': _effective_role(user) or user.role,
                 'status': getattr(user, 'status', ''),
                 'avatar_url': user.avatar_url or '',
+                'is_online': _is_user_online(user.id),
                 'created_at': user.created_at.isoformat() if user.created_at else None,
                 'group': None,
             }
@@ -5996,6 +6084,7 @@ def users_list(request):
                 'name': user.name,
                 'role': _effective_role(user) or user.role,
                 'avatar_url': user.avatar_url or '',
+                'is_online': _is_user_online(user.id),
             }
 
         if role in ('admin', 'superadmin'):
