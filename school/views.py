@@ -8,8 +8,8 @@ from django.conf import settings
 from django.core.files.storage import default_storage
 from django.utils.text import get_valid_filename
 from django.utils.dateparse import parse_date
-from urllib.parse import quote, urlencode
-from urllib.request import urlopen, Request
+from urllib.parse import quote
+from urllib.request import urlopen
 from urllib.error import URLError, HTTPError
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import AllowAny
@@ -1128,30 +1128,8 @@ def auth_google(request):
     Returns: {success, token, user}
     """
     id_token = request.data.get('id_token')
-    payload, status_code = _authenticate_google_id_token(id_token)
-    return Response(payload, status=status_code)
-
-
-def _google_client_id() -> str:
-    return (
-        os.getenv('GOOGLE_CLIENT_ID', '').strip()
-        or os.getenv('GOOGLE_OAUTH_CLIENT_ID', '').strip()
-        or os.getenv('NEXT_PUBLIC_GOOGLE_CLIENT_ID', '').strip()
-    )
-
-
-def _google_client_secret() -> str:
-    return (
-        os.getenv('GOOGLE_CLIENT_SECRET', '').strip()
-        or os.getenv('GOOGLE_SECRET', '').strip()
-        or os.getenv('GOOGLE_OAUTH_CLIENT_SECRET', '').strip()
-    )
-
-
-def _authenticate_google_id_token(id_token):
-    id_token = (id_token or '').strip()
     if not id_token:
-        return {'success': False, 'error': 'missing_id_token'}, 400
+        return Response({'success': False, 'error': 'missing_id_token'}, status=400)
 
     try:
         with urlopen(
@@ -1159,32 +1137,28 @@ def _authenticate_google_id_token(id_token):
         ) as response:
             token_info = json.loads(response.read().decode('utf-8'))
     except HTTPError:
-        return {'success': False, 'error': 'invalid_id_token'}, 401
+        return Response({'success': False, 'error': 'invalid_id_token'}, status=401)
     except URLError:
-        return {'success': False, 'error': 'google_unreachable'}, 502
+        return Response({'success': False, 'error': 'google_unreachable'}, status=502)
     except Exception:
-        return {'success': False, 'error': 'google_auth_failed'}, 401
+        return Response({'success': False, 'error': 'google_auth_failed'}, status=401)
 
     email = (token_info.get('email') or '').strip().lower()
     if not email:
-        return {'success': False, 'error': 'google_missing_email'}, 400
+        return Response({'success': False, 'error': 'google_missing_email'}, status=400)
 
-    expected_aud_values = [
-        os.getenv('GOOGLE_CLIENT_ID', '').strip(),
-        os.getenv('GOOGLE_OAUTH_CLIENT_ID', '').strip(),
-        os.getenv('NEXT_PUBLIC_GOOGLE_CLIENT_ID', '').strip(),
-    ]
-    expected_aud_values = [value for value in expected_aud_values if value]
+    expected_aud = os.getenv('GOOGLE_CLIENT_ID', '').strip()
     aud = (token_info.get('aud') or '').strip()
-    if expected_aud_values and aud and aud not in expected_aud_values:
-        return {'success': False, 'error': 'invalid_audience'}, 401
+    if expected_aud and aud and aud != expected_aud:
+        return Response({'success': False, 'error': 'invalid_audience'}, status=401)
 
     email_verified = token_info.get('email_verified')
     if str(email_verified).lower() not in ('true', '1', 'yes'):
-        return {'success': False, 'error': 'email_not_verified'}, 401
+        return Response({'success': False, 'error': 'email_not_verified'}, status=401)
 
     user = User.objects.filter(email=email).first()
     if not user:
+        # Create a student account by default
         user = User.objects.create(
             email=email,
             name=(token_info.get('name') or email.split('@')[0])[:255],
@@ -1208,81 +1182,22 @@ def _authenticate_google_id_token(id_token):
         algorithm='HS256',
     )
 
-    return {
-        'success': True,
-        'token': token,
-        'user': {
-            'id': user.id,
-            'email': user.email,
-            'name': user.name,
-            'role': effective_role,
-            'is_active': user.is_active,
-            'is_superadmin': user.is_superadmin,
-            'group_id': user.group_id,
-        },
-    }, 200
-
-
-@api_view(['GET'])
-@permission_classes([AllowAny])
-def auth_google_client_id(request):
-    client_id = _google_client_id()
-    if not client_id:
-        return Response({'success': False, 'error': 'google_not_configured'}, status=503)
-    return Response({'success': True, 'client_id': client_id}, status=200)
-
-
-@api_view(['POST'])
-@permission_classes([AllowAny])
-def auth_google_code(request):
-    code = (request.data.get('code') or '').strip()
-    redirect_uri = (request.data.get('redirect_uri') or '').strip()
-
-    if not code or not redirect_uri:
-        return Response({'success': False, 'error': 'invalid_request'}, status=400)
-
-    client_id = _google_client_id()
-    client_secret = _google_client_secret()
-    if not client_id or not client_secret:
-        return Response({'success': False, 'error': 'google_not_configured'}, status=503)
-
-    payload = urlencode(
+    return Response(
         {
-            'client_id': client_id,
-            'client_secret': client_secret,
-            'code': code,
-            'grant_type': 'authorization_code',
-            'redirect_uri': redirect_uri,
-        }
-    ).encode('utf-8')
-
-    try:
-        token_request = Request(
-            'https://oauth2.googleapis.com/token',
-            data=payload,
-            headers={'Content-Type': 'application/x-www-form-urlencoded'},
-            method='POST',
-        )
-        with urlopen(token_request) as response:
-            token_response = json.loads(response.read().decode('utf-8'))
-    except HTTPError as error:
-        try:
-            error_payload = json.loads(error.read().decode('utf-8'))
-            error_code = (error_payload.get('error') or 'oauth_error')
-        except Exception:
-            error_code = 'oauth_error'
-        return Response({'success': False, 'error': str(error_code)}, status=401)
-    except URLError:
-        return Response({'success': False, 'error': 'google_unreachable'}, status=502)
-    except Exception:
-        return Response({'success': False, 'error': 'oauth_error'}, status=500)
-
-    id_token = (token_response.get('id_token') or '').strip()
-    if not id_token:
-        return Response({'success': False, 'error': 'token_error'}, status=401)
-
-    auth_payload, status_code = _authenticate_google_id_token(id_token)
-    return Response(auth_payload, status=status_code)
+            'success': True,
+            'token': token,
+            'user': {
+                'id': user.id,
+                'email': user.email,
+                'name': user.name,
+                'role': effective_role,
+                'is_active': user.is_active,
+                'is_superadmin': user.is_superadmin,
+                'group_id': user.group_id,
+            },
+        },
+        status=200,
+    )
 
 
 @api_view(['GET', 'PUT'])
