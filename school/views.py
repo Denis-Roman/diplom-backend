@@ -3873,6 +3873,17 @@ def polls_list(request):
         except Exception:
             return None
 
+    def _sync_poll_status_if_expired(poll: Poll) -> str:
+        current_status = str(getattr(poll, 'status', '') or 'active')
+        if current_status == 'active' and getattr(poll, 'ends_at', None) and poll.ends_at < date.today():
+            poll.status = 'closed'
+            try:
+                poll.save(update_fields=['status'])
+            except Exception:
+                pass
+            return 'closed'
+        return current_status
+
     if request.method == 'POST':
         if role not in ('admin', 'superadmin'):
             return Response({'detail': 'Forbidden'}, status=403)
@@ -3982,6 +3993,7 @@ def polls_list(request):
             polls_qs = polls_qs.filter(target_type='all')
 
     for poll in polls_qs:
+        effective_status = _sync_poll_status_if_expired(poll)
         voters_count = (
             PollVote.objects
             .filter(option__poll=poll)
@@ -4001,7 +4013,7 @@ def polls_list(request):
             'options': [{'id': po.id, 'text': po.text, 'votes': po.votes.count() if hasattr(po, 'votes') else 0} for po in poll.options.all()],
             'endsAt': poll.ends_at.isoformat(),
             'createdAt': poll.created_at.isoformat() if poll.created_at else '',
-            'status': poll.status,
+            'status': effective_status,
             'votersCount': voters_count,
         })
     return Response(result)
@@ -4015,6 +4027,13 @@ def poll_detail(request, pk):
     """
     try:
         poll = Poll.objects.select_related('target_group').get(id=pk)
+
+        if poll.status == 'active' and getattr(poll, 'ends_at', None) and poll.ends_at < date.today():
+            poll.status = 'closed'
+            try:
+                poll.save(update_fields=['status'])
+            except Exception:
+                pass
 
         if request.method == 'DELETE':
             forbidden = _require_roles(request, ('admin', 'superadmin'))
@@ -4445,6 +4464,7 @@ def course_detail(request, pk):
 
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
+@parser_classes([JSONParser, MultiPartParser, FormParser])
 def course_add_material(request, pk):
     forbidden = _require_roles(request, ('admin', 'superadmin'))
     if forbidden:
@@ -4457,7 +4477,31 @@ def course_add_material(request, pk):
 
     title = request.data.get('title', '')
     material_type = request.data.get('type', 'video')
-    url = request.data.get('url', '')
+    url = str(request.data.get('url', '') or '').strip()
+
+    video_file = None
+    try:
+        video_file = request.FILES.get('video_file')
+    except Exception:
+        video_file = None
+
+    if material_type == 'video' and video_file:
+        safe_name = get_valid_filename(getattr(video_file, 'name', 'video'))
+        stored_path = default_storage.save(f"course_materials/{course.id}/{safe_name}", video_file)
+        media_path = f"{settings.MEDIA_URL}{stored_path}"
+        url = _absolute_file_url(request, media_path)
+
+    normalized_url = str(url or '').strip().lower()
+
+    if material_type == 'youtube' and not (
+        'youtube.com' in normalized_url or
+        'youtu.be/' in normalized_url or
+        '/embed/' in normalized_url
+    ):
+        return Response({'success': False, 'error': 'Некоректне YouTube-посилання'}, status=400)
+
+    if material_type in ('video', 'document', 'link') and normalized_url and not normalized_url.startswith(('http://', 'https://')):
+        return Response({'success': False, 'error': 'URL має починатися з http:// або https://'}, status=400)
 
     if not title or not url:
         return Response({'success': False, 'error': 'Назва та URL обов\'язкові'}, status=400)

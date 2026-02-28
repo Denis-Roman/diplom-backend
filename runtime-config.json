@@ -1,0 +1,4 @@
+{
+  "linuxFxVersion": "PYTHON|3.12",
+  "appCommandLine": "sh start.sh"
+}

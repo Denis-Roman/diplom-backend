@@ -1,0 +1,6 @@
+﻿{
+    "properties":  {
+                       "appCommandLine":  "pip install -r requirements.txt; chmod +x start.sh; ./start.sh",
+                       "linuxFxVersion":  "PYTHON|3.12"
+                   }
+}
