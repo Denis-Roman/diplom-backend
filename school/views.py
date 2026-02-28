@@ -4353,7 +4353,7 @@ def course_detail(request, pk):
                 options_data = [{
                     'id': o.id,
                     'text': o.text,
-                    'is_correct': o.is_correct if role in ('admin', 'superadmin') else None,
+                    'is_correct': o.is_correct,
                     'order': o.order
                 } for o in q.options.all()]
 
