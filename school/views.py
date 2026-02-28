@@ -4305,6 +4305,7 @@ def poll_close(request, pk):
 
 @api_view(['GET', 'POST'])
 @permission_classes([IsAuthenticated])
+@parser_classes([JSONParser, MultiPartParser, FormParser])
 def courses_list(request):
     role = _effective_role(getattr(request, 'user', None))
 
@@ -4344,14 +4345,31 @@ def courses_list(request):
             except Subject.DoesNotExist:
                 pass
 
+        thumbnail_url = str(request.data.get('thumbnail', '') or '').strip()
+        thumbnail_file = None
+        try:
+            thumbnail_file = request.FILES.get('thumbnail_file')
+        except Exception:
+            thumbnail_file = None
+
         course = Course.objects.create(
             title=title,
             description=request.data.get('description', ''),
             group=group,
             subject=subject,
-            thumbnail=request.data.get('thumbnail', ''),
+            thumbnail=thumbnail_url,
             is_published=_parse_bool(request.data.get('is_published', False), default=False)
         )
+
+        if thumbnail_file:
+            try:
+                safe_name = get_valid_filename(getattr(thumbnail_file, 'name', 'thumbnail'))
+                stored_path = default_storage.save(f"course_thumbnails/{course.id}/{safe_name}", thumbnail_file)
+                media_path = f"{settings.MEDIA_URL}{stored_path}"
+                course.thumbnail = _absolute_file_url(request, media_path)
+                course.save(update_fields=['thumbnail'])
+            except Exception:
+                pass
 
         return Response({
             'success': True,
@@ -4416,6 +4434,7 @@ def courses_list(request):
 
 @api_view(['GET', 'PUT', 'DELETE'])
 @permission_classes([IsAuthenticated])
+@parser_classes([JSONParser, MultiPartParser, FormParser])
 def course_detail(request, pk):
     role = _effective_role(getattr(request, 'user', None))
     try:
@@ -4521,8 +4540,25 @@ def course_detail(request, pk):
 
         course.title = request.data.get('title', course.title)
         course.description = request.data.get('description', course.description)
-        course.thumbnail = request.data.get('thumbnail', course.thumbnail)
+        thumbnail_in_payload = request.data.get('thumbnail', None)
+        if thumbnail_in_payload is not None:
+            course.thumbnail = thumbnail_in_payload
         course.is_published = _parse_bool(request.data.get('is_published', course.is_published), default=bool(course.is_published))
+
+        thumbnail_file = None
+        try:
+            thumbnail_file = request.FILES.get('thumbnail_file')
+        except Exception:
+            thumbnail_file = None
+
+        if thumbnail_file:
+            try:
+                safe_name = get_valid_filename(getattr(thumbnail_file, 'name', 'thumbnail'))
+                stored_path = default_storage.save(f"course_thumbnails/{course.id}/{safe_name}", thumbnail_file)
+                media_path = f"{settings.MEDIA_URL}{stored_path}"
+                course.thumbnail = _absolute_file_url(request, media_path)
+            except Exception:
+                pass
 
         group_id = request.data.get('group_id')
         if group_id:
