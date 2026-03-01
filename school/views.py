@@ -82,11 +82,6 @@ from django.contrib.auth.hashers import make_password, check_password
 def _effective_role(user) -> str | None:
     if not user:
         return None
-    if not bool(getattr(user, 'is_active', True)):
-        return None
-    user_status = str(getattr(user, 'status', '') or '').strip().lower()
-    if user_status == 'inactive':
-        return None
     if getattr(user, 'is_superadmin', False):
         return 'superadmin'
     raw_role = getattr(user, 'role', None)
