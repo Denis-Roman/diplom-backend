@@ -35,6 +35,10 @@ class JWTAuthentication(BaseAuthentication):
         except User.DoesNotExist:
             raise AuthenticationFailed('User not found')
 
+        user_status = str(getattr(user, 'status', '') or '').strip().lower()
+        if not bool(getattr(user, 'is_active', True)) or user_status == 'inactive':
+            raise AuthenticationFailed('Account is inactive')
+
         # If legacy data has membership in GroupStudents but Users.group is null,
         # patch it for the current request to keep API filters working.
         if getattr(user, 'role', None) == 'student' and getattr(user, 'group_id', None) is None:

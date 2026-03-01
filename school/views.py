@@ -82,6 +82,11 @@ from django.contrib.auth.hashers import make_password, check_password
 def _effective_role(user) -> str | None:
     if not user:
         return None
+    if not bool(getattr(user, 'is_active', True)):
+        return None
+    user_status = str(getattr(user, 'status', '') or '').strip().lower()
+    if user_status == 'inactive':
+        return None
     if getattr(user, 'is_superadmin', False):
         return 'superadmin'
     raw_role = getattr(user, 'role', None)
@@ -1113,6 +1118,11 @@ def auth_me(request):
     if not isinstance(user, User):
         return Response({'success': True, 'user': None}, status=200)
 
+    if not bool(getattr(user, 'is_active', True)) or str(getattr(user, 'status', '') or '').strip().lower() == 'inactive':
+        response = Response({'success': True, 'user': None}, status=200)
+        response.delete_cookie('auth-token', path='/')
+        return response
+
     _mark_user_online(user)
 
     effective_role = _effective_role(user) or 'student'
@@ -1238,6 +1248,12 @@ def auth_login(request):
 
     if not password_ok:
         return Response({'success': False, 'error': 'Невірний email або пароль'}, status=401)
+
+    if not bool(getattr(user, 'is_active', True)) or str(getattr(user, 'status', '') or '').strip().lower() == 'inactive':
+        response = Response({'success': False, 'error': 'Акаунт деактивовано. Зверніться до адміністратора.'}, status=403)
+        response.delete_cookie('auth-token', path='/')
+        return response
+
     token = jwt.encode(
         {
             'userId': user.id,
@@ -1330,6 +1346,9 @@ def auth_google(request):
             is_active=True,
             is_superadmin=False,
         )
+
+    if not bool(getattr(user, 'is_active', True)) or str(getattr(user, 'status', '') or '').strip().lower() == 'inactive':
+        return Response({'success': False, 'error': 'account_inactive'}, status=403)
 
     effective_role = user.role
     if getattr(user, 'is_superadmin', False) and effective_role != 'superadmin':
