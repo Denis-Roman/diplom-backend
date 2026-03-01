@@ -1700,11 +1700,17 @@ def student_detail(request, pk):
     forbidden = _require_roles(request, ('admin', 'superadmin'))
     if forbidden:
         return forbidden
-    try:
-        student = User.objects.get(id=pk)
-        if _effective_role(student) != 'student':
-            raise User.DoesNotExist
-    except User.DoesNotExist:
+    student = (
+        User.objects
+        .filter(id=pk)
+        .filter(
+            models.Q(role__iexact='student') |
+            models.Q(role__iexact='user') |
+            models.Q(role__iexact='pupil')
+        )
+        .first()
+    )
+    if not student:
         return Response({'success': False, 'error': 'Студент не знайдений'}, status=404)
     if request.method == 'GET':
         return Response({
