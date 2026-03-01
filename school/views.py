@@ -886,6 +886,7 @@ def administrators_list(request):
             "is_active": user.is_active,
             "is_superadmin": user.is_superadmin,
             "created_at": user.created_at,
+            "avatar_url": user.avatar_url or '',
         }, status=201)
 
     # GET: спи��ок адміністраторів і суперадмінів
@@ -895,7 +896,8 @@ def administrators_list(request):
             "id": u.id, "name": u.name, "email": u.email,
             "is_active": u.is_active,
             "is_superadmin": u.is_superadmin,
-            "created_at": u.created_at
+            "created_at": u.created_at,
+            "avatar_url": u.avatar_url or '',
         } for u in admins
     ])
 
@@ -1669,6 +1671,7 @@ def students_list(request):
             "name": u.name,
             "email": u.email,
             "is_active": u.is_active,
+            "avatar_url": u.avatar_url or '',
             "group": {
                 "id": g.id,
                 "name": g.name,
@@ -1886,6 +1889,7 @@ def groups_list(request):
                     'id': member.id,
                     'name': member.name,
                     'email': member.email,
+                    'avatar_url': member.avatar_url or '',
                 }
                 for member in members_qs
                 if _effective_role(member) == 'student'
@@ -1941,6 +1945,7 @@ def group_detail(request, pk):
                 'id': member.id,
                 'name': member.name,
                 'email': member.email,
+                'avatar_url': member.avatar_url or '',
             }
             for member in members_qs
             if _effective_role(member) == 'student'
@@ -1974,6 +1979,7 @@ def group_detail(request, pk):
                 'id': member.id,
                 'name': member.name,
                 'email': member.email,
+                'avatar_url': member.avatar_url or '',
             }
             for member in members_qs
             if _effective_role(member) == 'student'
@@ -2011,7 +2017,7 @@ def group_students(request, pk):
     try:
         students = GroupStudent.objects.filter(group=group).select_related('student')
         return Response(
-            [{'id': gs.student.id, 'email': gs.student.email, 'name': gs.student.name, 'role': gs.student.role} for gs
+            [{'id': gs.student.id, 'email': gs.student.email, 'name': gs.student.name, 'role': gs.student.role, 'avatar_url': gs.student.avatar_url or ''} for gs
              in students])
     except:
         return Response([])
@@ -4935,6 +4941,7 @@ def teams_list(request):
                 'id': m.student.id,
                 'name': m.student.name,
                 'email': m.student.email,
+                'avatar_url': m.student.avatar_url or '',
                 'points': points_by_student_id.get(int(m.student_id), 0),
             }
         )
@@ -5075,7 +5082,7 @@ def team_members(request, pk):
     try:
         team = Team.objects.get(id=pk)
         members = TeamMember.objects.filter(team=team)
-        return Response([{'id': m.student.id, 'name': m.student.name, 'email': m.student.email} for m in members])
+        return Response([{'id': m.student.id, 'name': m.student.name, 'email': m.student.email, 'avatar_url': m.student.avatar_url or ''} for m in members])
     except Team.DoesNotExist:
         return Response({'success': False, 'error': 'Команда не знайдена'}, status=404)
 
