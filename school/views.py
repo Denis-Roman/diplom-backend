@@ -1722,8 +1722,15 @@ def student_detail(request, pk):
     if request.method == 'PUT':
         student.name = request.data.get('name', student.name)
         student.email = request.data.get('email', student.email)
+        password = request.data.get('password', None)
         group_id = request.data.get('group_id', None)
         is_active = request.data.get('is_active', None)
+        if password is not None:
+            password_value = str(password)
+            if password_value:
+                if len(password_value) < 6:
+                    return Response({'success': False, 'error': 'Пароль має бути не менше 6 символів'}, status=400)
+                student.password = make_password(password_value)
         if is_active is not None:
             # Безпечне приведення типу!
             if isinstance(is_active, bool):
